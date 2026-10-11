@@ -14,3 +14,4 @@ node_modules/
 /android/debug.keystore
 /android/build
 tools/greenteaspeak-plugin/*.zip
+/out/
