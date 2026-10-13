@@ -1161,6 +1161,24 @@ impl Launcher {
         let running = self.state.instances.iter().filter(|i| i.running).count();
         let jobs = self.state.jobs.iter().filter(|j| j.finished.is_none()).count();
         for (p, name, icon) in PAGES {
+            // [ROLLBACK tabs-119] no Profile button (the driver's card below opens it); Mods and Timetable only
+            // where Settings > General asks for them
+            let shown = |key: &str| {
+                self.state
+                    .settings
+                    .get(key)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            };
+            let hidden = match p {
+                Page::Profile => true,
+                Page::Mods => !shown("show_mods_tab") && self.page != Page::Mods,
+                Page::Timetable => !shown("show_timetable_tab") && self.page != Page::Timetable,
+                _ => false,
+            };
+            if hidden {
+                continue;
+            }
             let r = Rect::new(12.0, y, RAIL_W - 24.0, 38.0);
             let id = ui::id_of(&format!("nav-{name}"));
             let (h, _, clicked) = self.ui.interact(id, r);

@@ -292,10 +292,17 @@ impl RigidWheel {
 pub fn wheel_rest_loads(def: &Vehicle) -> Vec<f32> {
     let mass = if def.mass < 100.0 { def.mass * 1000.0 } else { def.mass }.max(500.0);
     let cog_y = def.cog.map(|c| c[1]).unwrap_or(0.0);
+    let longs: Vec<f32> = def.axles.iter().map(|a| a.long).collect();
+    rest_loads_for(&longs, mass, cog_y)
+}
+
+/// [ROLLBACK payload-121] `wheel_rest_loads` for axles at `longs`, a body of `mass` kg whose centre of gravity
+/// lies `cog_y` m ahead of the model origin.
+pub fn rest_loads_for(longs: &[f32], mass: f32, cog_y: f32) -> Vec<f32> {
     let g = 9.81;
-    let n = (def.axles.len() * 2).max(1) as f32;
-    let sy: f32 = def.axles.iter().map(|a| 2.0 * a.long).sum();
-    let syy: f32 = def.axles.iter().map(|a| 2.0 * a.long * a.long).sum();
+    let n = (longs.len() * 2).max(1) as f32;
+    let sy: f32 = longs.iter().map(|l| 2.0 * l).sum();
+    let syy: f32 = longs.iter().map(|l| 2.0 * l * l).sum();
     let det = n * syy - sy * sy;
     let (a, b) = if det.abs() > 1e-6 {
         let rhs1 = mass * g;
@@ -304,7 +311,10 @@ pub fn wheel_rest_loads(def: &Vehicle) -> Vec<f32> {
     } else {
         (mass * g / n, 0.0)
     };
-    def.axles.iter().map(|x| (a + b * x.long).max(mass * g / n * 0.2)).collect()
+    longs
+        .iter()
+        .map(|l| (a + b * l).max(mass * g / n * 0.2))
+        .collect()
 }
 
 /// A wheel on the ground in one substep, before its tyre forces are settled.
@@ -429,6 +439,10 @@ pub struct RigidBody {
     /// as OMSI's do - its wheels know no faces - and a step nobody sees (a height profile
     /// over the drawn road, a helper object's collision box) is no invisible wall.
     pub wheel_walls: bool,
+    /// [ROLLBACK payload-121] The body without its passengers (mass, inertia, centre of gravity, body
+    /// frequency) and the passengers now carried on it (kg, their centre in the model's frame).
+    pub dry: (f32, Vec3, Vec3, f32),
+    pub payload: (f32, Vec3),
 }
 
 impl RigidBody {
@@ -480,7 +494,51 @@ impl RigidBody {
         let inv_min_turn_radius = if def.inv_min_turn_radius > 0.0 { def.inv_min_turn_radius } else { max_steer_deg.to_radians().tan() / s };
         let springs: f32 = def.axles.iter().map(|a| 2.0 * if a.spring > 0.0 { a.spring } else { 150.0 }).sum();
         let body_freq = (springs / (mass / 1000.0)).max(0.0).sqrt();
-        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, kappa: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true }
+        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, kappa: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true, dry: (mass, inertia, cog, body_freq), payload: (0.0, Vec3::ZERO) }
+    }
+
+    /// [ROLLBACK payload-121] Carry `kg` of passengers whose centre is at `at` (the model's frame): the body's
+    /// mass, centre of gravity, inertia, body frequency and the static loads of its wheels follow, the model
+    /// stays where it stands. The same call with the same numbers changes nothing.
+    pub fn set_payload(&mut self, kg: f32, at: Vec3) {
+        let kg = if kg.is_finite() { kg.max(0.0) } else { 0.0 };
+        let at = if kg > 0.0 && at.is_finite() {
+            at
+        } else {
+            self.dry.2
+        };
+        if (kg - self.payload.0).abs() < 0.5 && (at - self.payload.1).length() < 0.05 {
+            return;
+        }
+        let (m0, i0, c0, f0) = self.dry;
+        let origin = self.position - self.orientation.mul_vec3(self.cog).as_dvec3();
+        let mass = m0 + kg;
+        let cog = (c0 * m0 + at * kg) / mass;
+        let about = |p: Vec3, m: f32| {
+            let d = p - cog;
+            Vec3::new(
+                d.y * d.y + d.z * d.z,
+                d.x * d.x + d.z * d.z,
+                d.x * d.x + d.y * d.y,
+            ) * m
+        };
+        self.inertia = i0 + about(c0, m0) + about(at, kg);
+        self.mass = mass;
+        self.cog = cog;
+        self.body_freq = f0 * (m0 / mass).sqrt();
+        self.position = origin + self.orientation.mul_vec3(cog).as_dvec3();
+        let mut longs: Vec<f32> = Vec::new();
+        for (w, a) in self.wheels.iter().zip(&self.wheel_axle) {
+            if longs.len() <= *a {
+                longs.resize(*a + 1, 0.0);
+            }
+            longs[*a] = w.attach.y;
+        }
+        let loads = rest_loads_for(&longs, mass, cog.y);
+        for (w, a) in self.wheels.iter_mut().zip(&self.wheel_axle) {
+            w.rest_load = loads.get(*a).copied().unwrap_or(w.rest_load);
+        }
+        self.payload = (kg, at);
     }
 
     /// `fresh`, a body made again from the definition (edited meanwhile), with the motion of
@@ -1664,6 +1722,22 @@ mod tests {
                 assert!(rb.forward_speed() > speed * 0.9, "{kmh} km/h at {fps} fps: lost speed");
             }
         }
+    }
+
+    /// [ROLLBACK payload-121] Passengers weigh: the body is heavier by their mass, its wheels carry more and
+    /// the centre of gravity moves towards them; with none aboard it is the empty body again.
+    #[test]
+    fn passengers_make_the_body_heavier() {
+        let mut rb = RigidBody::from_definition(&bus(), &[]);
+        let (m0, cog0) = (rb.mass, rb.cog);
+        let load = |rb: &RigidBody| rb.wheels.iter().map(|w| w.rest_load).sum::<f32>();
+        let l0 = load(&rb);
+        rb.set_payload(3000.0, Vec3::new(0.0, -4.0, 1.0));
+        assert!((rb.mass - m0 - 3000.0).abs() < 1.0, "{} {m0}", rb.mass);
+        assert!(load(&rb) > l0 + 3000.0 * 9.81 * 0.9, "{} {l0}", load(&rb));
+        assert!(rb.cog.y < cog0.y, "{:?} {:?}", rb.cog, cog0);
+        rb.set_payload(0.0, Vec3::ZERO);
+        assert!((rb.mass - m0).abs() < 1e-3 && (rb.cog - cog0).length() < 1e-4);
     }
 
     /// `Axle_Steering_*` is the axle's angle, one for both sides, the same to the left as to

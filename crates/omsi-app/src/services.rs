@@ -28,9 +28,16 @@ pub(crate) fn run_export(args: &Args, out: &PathBuf) -> Result<()> {
 /// a little beside the box, and the bus had to be driven into the object.
 pub(crate) const PETROL_REACH: f64 = 5.0;
 
+/// [ROLLBACK petrol-93] The `skip_petrol_check` setting, set each frame by the game.
+pub(crate) static SKIP_PETROL_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Does the vehicle's box overlap (or come within `PETROL_REACH` of) one of the loaded `[petrolstation]` objects? That is
 /// OMSI's test for the pump, the wash and a repair without travel time.
 pub(crate) fn at_petrol_station(world: &World, v: &omsi_sim::VehicleInstance) -> bool {
+    // [ROLLBACK petrol-93] the `skip_petrol_check` setting: the pump and the wash work anywhere
+    if SKIP_PETROL_CHECK.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     let f = crate::lan::footprint_of(v, [2.5, 11.5, 3.0, 0.0, 0.0, 1.5]);
     let me = omsi_sim::collision::Obb {
         center: glam::DVec2::new(f.x, f.y),

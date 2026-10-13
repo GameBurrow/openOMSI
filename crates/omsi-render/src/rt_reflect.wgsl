@@ -92,6 +92,42 @@ fn on_screen(pt: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(0.0);
 }
 
+// [ROLLBACK headlamp-110] see the cap at the end of `cs_reflect`.
+
+// [ROLLBACK rtspot-112] how much of its brightness a lit patch of the picture keeps in a reflection
+// (1.0: all of it, as before) and the number of spot lights known (rt.rs `RT_SPOTS`).
+const RT_SPOT_KEEP: f32 = 0.12;
+const RT_SPOTS: i32 = 12;
+
+// How dark the sky is: 1 at night (a sky irradiance of 0.05 and under), 0 by day (0.4 and over).
+fn night_amount() -> f32 {
+    let sky_lum = dot(sh_irradiance(vec3<f32>(0.0, 0.0, 1.0)), vec3<f32>(0.2126, 0.7152, 0.0722));
+    return 1.0 - smoothstep(0.05, 0.4, sky_lum);
+}
+
+// How much of a point a spot light of the list lights: 1 inside its cone and close, 0 outside it or
+// out of its range.
+fn spot_lit(pt: vec3<f32>) -> f32 {
+    var k = 0.0;
+    for (var i = 0; i < RT_SPOTS; i++) {
+        let a = p.spots[2 * i];
+        let b = p.spots[2 * i + 1];
+        if (a.w <= 0.0) {
+            continue;
+        }
+        let v = pt - a.xyz;
+        let dist = length(v);
+        if (dist >= a.w || dist < 0.01) {
+            continue;
+        }
+        let cd = dot(v / dist, b.xyz);
+        let cone = smoothstep(b.w, mix(b.w, 1.0, 0.35), cd);
+        k = max(k, cone * (1.0 - smoothstep(0.5 * a.w, a.w, dist)));
+    }
+    return k;
+}
+const RT_NIGHT_CAP: f32 = 0.35;
+
 // The light a reflected ray brings back from where it meets the scene: the picture's own
 // colour there, else the mesh's mean colour in the sun and the sky's light.
 // Whether a point (render-origin relative) is inside the player's vehicle's box.
@@ -176,7 +212,11 @@ fn hit_light(o: vec3<f32>, d: vec3<f32>, h: Hit, rough: f32, cab: f32) -> vec3<f
     let pt = o + d * h.t;
     let sc = on_screen(pt);
     if (sc.x == 1.0) {
-        return finite(textureSampleLevel(t_scene, s_lin, sc.yz, 0.0).rgb);
+        let seen = finite(textureSampleLevel(t_scene, s_lin, sc.yz, 0.0).rgb);
+        // [ROLLBACK rtspot-112] at night what a spot light lights (a headlamp's pool on the road, the
+        // grass, the kerb) is not taken into the reflection: it is shown at RT_SPOT_KEEP of its
+        // brightness there, the less the farther from the beam's axis and from the lamp
+        return seen * mix(1.0, RT_SPOT_KEEP, spot_lit(pt) * night_amount());
     }
     let r = records[h.record];
     var albedo = r.color.rgb;
@@ -238,8 +278,9 @@ fn cs_reflect(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var i = 0; i < REFL_DIV; i++) {
             let q = min(hp * REFL_DIV + vec2<i32>(i, j), size - vec2<i32>(1));
             let s = textureLoad(t_gbuf, q, 0);
-            if (s.w > g.w) {
-                g = s;
+            // [ROLLBACK cover-115] the weight is the length of the vector, its alpha is what covers
+            if (length(s.xyz) > g.w) {
+                g = vec4<f32>(s.xyz, length(s.xyz));
                 px = q;
             }
         }
@@ -326,7 +367,13 @@ fn cs_reflect(@builtin(global_invocation_id) gid: vec3<u32>) {
     // (no single ray brighter than the sky's brightest: the sun's own glint on the surface
     // is the main pass's, and a ray that found the sun's disc was a speck of light)
     let lum = dot(l, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let cap = 2.5 * enh.exposure.x * max(dot(sh_irradiance(vec3<f32>(0.0, 0.0, 1.0)), vec3<f32>(0.2126, 0.7152, 0.0722)), 0.05);
+    let sky_lum = dot(sh_irradiance(vec3<f32>(0.0, 0.0, 1.0)), vec3<f32>(0.2126, 0.7152, 0.0722));
+    // [ROLLBACK headlamp-110] at night what is picked up in a reflection is mostly the pool of a
+    // vehicle's own lamps on the road in the picture, and it lay as a second, burned patch on the
+    // bodywork in front of the lamps: the brightest a ray may be falls to RT_NIGHT_CAP of what it
+    // was as the sky darkens (0.05 and under: night; 0.4 and over: day). 1.0: as before.
+    let dark = 1.0 - smoothstep(0.05, 0.4, sky_lum);
+    let cap = 2.5 * enh.exposure.x * max(sky_lum, 0.05) * mix(1.0, RT_NIGHT_CAP, dark);
     l = l * min(1.0, cap / max(lum, 1e-5));
     if (p.temporal.z == 8.0) {
         l = vec3<f32>(f32(dist > p.proj.z), rough, 0.0);
@@ -357,7 +404,9 @@ fn vs_full(@builtin(vertex_index) i: u32) -> VsOut {
 @fragment
 fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     let px = vec2<i32>(in.clip.xy);
-    let g = textureLoad(t_gbuf, px, 0);
+    let g0 = textureLoad(t_gbuf, px, 0);
+    // [ROLLBACK cover-115] the weight is the length of the vector (its alpha is the coverage)
+    let g = vec4<f32>(g0.xyz, length(g0.xyz));
     if (g.w < 0.002) {
         discard;
     }

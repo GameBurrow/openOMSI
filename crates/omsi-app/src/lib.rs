@@ -609,6 +609,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         menu_edit_icao: false,
         dest_form: Default::default(),
         swap_pending: false,
+        placed_clear_t: 0.0,
         menu_drag: None,
         menu_kbd: true,
         weather_blend: None,

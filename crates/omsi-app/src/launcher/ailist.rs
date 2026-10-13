@@ -35,6 +35,9 @@ pub struct AiView {
     picked: String,
     makers: Vec<drive::BusManufacturer>,
     makers_n: usize,
+    /// [ROLLBACK ailist-93] The page has taken the Drive page's map once; after that the map
+    /// is the one picked here (it was put back on the Drive page's every time).
+    synced: bool,
     /// Changed and not saved yet.
     dirty: bool,
     /// The reset button was pressed once.
@@ -106,7 +109,8 @@ pub fn draw(l: &mut Launcher, area: Rect) {
     }
     {
         let av = &mut l.pages.ai;
-        if av.loaded.is_none() {
+        if !av.synced {
+            av.synced = true;
             if let Some(k) = maps.iter().position(|m| m.1 == l.state.choice.map) {
                 av.map = k;
             }
@@ -317,10 +321,16 @@ pub fn draw(l: &mut Launcher, area: Rect) {
     if ui.button("ai-save", Rect::new(inner.x, by, inner.w, ROW), if av.dirty { "Save" } else { "Saved" }, Some("save"), if av.dirty { ButtonKind::Primary } else { ButtonKind::Normal }) && av.dirty {
         let saved = save_target(&av.map_dir).and_then(|p| std::fs::write(&p, &av.bytes).map(|_| p).map_err(|e| e.to_string()));
         match saved {
-            Ok(_) => {
+            Ok(p) => {
                 av.dirty = false;
                 omsi_cfg::content_changed();
-                status = Some(("AI list saved: it counts the next time a game starts".into(), false));
+                // [ROLLBACK ailist-93] what the game would read now must be what was written
+                let seen = source(&av.map_dir);
+                if omsi_cfg::vfs::read(&seen).map(|b| b != av.bytes).unwrap_or(true) {
+                    status = Some((format!("Saved to {}, but the game reads {}: that file wins", p.display(), seen.display()), true));
+                } else {
+                    status = Some(("AI list saved: it counts the next time a game starts".into(), false));
+                }
             }
             Err(e) => status = Some((format!("Not saved: {e}"), true)),
         }

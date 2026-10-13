@@ -188,6 +188,48 @@ impl App {
         }
     }
 
+    /// [ROLLBACK takeover-122] The vehicles the player placed stay where they were put - also when
+    /// the tile they stand on has been unloaded and comes back: its parked cars return with it,
+    /// and one of them standing in a placed vehicle goes again, as it did when the vehicle was
+    /// put down. Every two seconds, for the vehicles within a kilometre of the camera.
+    pub(crate) fn keep_placed_places_clear(&mut self, dt: f32) {
+        if self.placed.is_empty() {
+            return;
+        }
+        self.placed_clear_t -= dt;
+        if self.placed_clear_t > 0.0 {
+            return;
+        }
+        self.placed_clear_t = 2.0;
+        let (Some(w), Some(r), Some(scene)) = (
+            self.world.clone(),
+            self.renderer.as_ref(),
+            self.scene.as_mut(),
+        ) else {
+            return;
+        };
+        let here = self.camera.as_ref().map(|c| c.position.truncate());
+        for q in &self.placed {
+            if here.is_some_and(|c| (q.vehicle.position.truncate() - c).length() > 1000.0) {
+                continue;
+            }
+            let bb = q
+                .vehicle
+                .ty
+                .def
+                .bounding_box
+                .unwrap_or([2.5, 11.5, 3.0, 0.0, 0.0, 1.5]);
+            let n = w.clear_parked_under(
+                r,
+                scene,
+                &omsi_sim::collision::Obb::from_box(bb, q.vehicle.position, q.vehicle.heading),
+            );
+            if n > 0 {
+                log::info!("placed vehicle: {n} parked vehicle(s) that came back with the tile cleared from its place");
+            }
+        }
+    }
+
     /// Every vehicle one placed goes (Esc menu: Remove the placed vehicles), their riders
     /// stepping out where they are.
     pub(crate) fn remove_placed_vehicles(&mut self) {

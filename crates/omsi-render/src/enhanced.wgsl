@@ -295,6 +295,40 @@ const LAMP_WRAP: f32 = 0.25;
 const LAMP_BOUNCE: f32 = 0.22;
 // [ROLLBACK lampfill-44 end]
 
+// [ROLLBACK headlamp-110] How a vehicle's headlamps (a spot or a beam cookie) shine back at a viewer
+// in front of them: seen from there the road, the grass and the kerbs lay in the mirror position of
+// the lamp and the GGX highlight, strong at the grazing angle, burned out. From behind the lamps
+// (along the beam) nothing of it shows, so only the highlight is touched: its lobe is never narrower
+// than HEADLAMP_ALPHA_MIN (the GGX alpha, roughness squared) and widens by HEADLAMP_SPREAD per metre
+// from the lamp (the farther, the more spread out and blurred), and it is capped at HEADLAMP_SPEC_CAP
+// (the highlight's factor against the diffuse one's 0.1 - 0.3). Before: the surface's own roughness,
+// no spread, no cap (set HEADLAMP_ALPHA_MIN 0, HEADLAMP_SPREAD 0, HEADLAMP_SPEC_CAP 1.0e6).
+// ([ROLLBACK headlamp-111] 0.30 / 0.010 / 0.45 were still too strong: now 0.45 / 0.015 / 0.20)
+const HEADLAMP_ALPHA_MIN: f32 = 0.45;
+const HEADLAMP_SPREAD: f32 = 0.015;
+const HEADLAMP_SPEC_CAP: f32 = 0.20;
+const HEADLAMP_EDGE_SPREAD: f32 = 0.002;
+
+// [ROLLBACK headlamp-112] What the headlamps light is brought down to a peak: as it lands on the
+// picture (times the exposure) it passes through unchanged up to HEADLAMP_KNEE, and above that rises
+// smoothly towards HEADLAMP_PEAK and no further - however strong the lamps are set and however near
+// the surface is (the road a few metres in front of the car burned out to a white patch, the more
+// so seen from the front). The colour is kept. HEADLAMP_PEAK 1.0e6 puts the old behaviour back.
+// ([ROLLBACK headlamp-113] 0.45 / 1.1 left the pool white: the tone curve bleaches above 0.64 and the
+// metering lifts a night picture by up to 0.6 more - now 0.15 / 0.50)
+const HEADLAMP_KNEE: f32 = 0.15;
+const HEADLAMP_PEAK: f32 = 0.50;
+fn headlamp_shoulder(c: vec3<f32>) -> vec3<f32> {
+    // (as it comes out of the tone mapping's metering: `exposure.y` is the correction's inverse)
+    let pre = enh.exposure.x / max(enh.exposure.y, 0.5);
+    let lum = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)) * pre;
+    if (lum <= HEADLAMP_KNEE) {
+        return c;
+    }
+    let y = HEADLAMP_KNEE + (HEADLAMP_PEAK - HEADLAMP_KNEE) * (1.0 - exp(-(lum - HEADLAMP_KNEE) / (HEADLAMP_PEAK - HEADLAMP_KNEE)));
+    return c * (y / lum);
+}
+
 // The point and spot lights of the pixel's grid cell: diffuse and specular.
 // `thin`: foliage, lit from whichever side the lamp is on (see the sun below).
 fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool) -> vec3<f32> {
@@ -315,12 +349,16 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
     // (Settings: "Lamp fill light", enh.led.w 1; 0 = off)
     let lamp_wrap = LAMP_WRAP * enh.led.w;
     let base = (u32(y) * side + u32(x)) * CELL_CAP;
+    // [ROLLBACK headlamp-112] what the headlamps (spots, beam cookies) add up to, kept apart: it is
+    // brought down to a peak below the tone curve's knee at the end (see HEADLAMP_KNEE)
+    var head = vec3<f32>(0.0);
     for (var j = 0u; j < CELL_CAP; j = j + 1u) {
         let li = grid[base + j];
         if (li == 0xffffffffu) {
             break;
         }
         let l = lights[li];
+        let headlamp = l.cookie.x > 0.5 || l.dir.w > -1.5;
         let d = l.pos.xyz - p;
         let dist2 = dot(d, d);
         // (pos.w is 0 on a spot light, which the vanilla shader is to pass by)
@@ -353,7 +391,10 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
             }
         } else if (l.dir.w > -1.5) {
             let cd = dot(-ld, l.dir.xyz);
-            e = e * smoothstep(l.dir.w, l.extra.x, cd);
+            // ([ROLLBACK headlamp-111] the edge of the cone is softer the farther from the lamp:
+            // the beam spreads out; HEADLAMP_EDGE_SPREAD 0 = as before)
+            let soft = clamp(dist * HEADLAMP_EDGE_SPREAD, 0.0, 0.08);
+            e = e * smoothstep(l.dir.w - soft, l.extra.x, cd);
             if (l.extra.z > 0.0) {
                 // a low beam: brightest just under its cut-off, where it reaches far down
                 // the road (the gain keeps the light on a flat road from falling off with
@@ -398,11 +439,21 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
         var spec = vec3<f32>(0.0);
         if (nl > 0.0) {
             let h = normalize(ld + v);
-            spec = d_ggx(max(dot(n, h), 0.0), a) * v_smith(nv, nl, a) * f_schlick(sf.f0, dot(v, h)) * nl;
+            // ([ROLLBACK headlamp-110] a headlamp's highlight: broader with the distance, capped)
+            let a_l = select(a, clamp(max(a, HEADLAMP_ALPHA_MIN) + dist * HEADLAMP_SPREAD, 0.02, 0.85), headlamp);
+            spec = d_ggx(max(dot(n, h), 0.0), a_l) * v_smith(nv, nl, a_l) * f_schlick(sf.f0, dot(v, h)) * nl;
+            if (headlamp) {
+                spec = min(spec, vec3<f32>(HEADLAMP_SPEC_CAP));
+            }
         }
-        sum = sum + irr * (nlw * sf.albedo / PI + spec);
+        let lit = irr * (nlw * sf.albedo / PI + spec);
+        if (headlamp) {
+            head = head + lit;
+        } else {
+            sum = sum + lit;
+        }
     }
-    return sum;
+    return sum + headlamp_shoulder(head);
 }
 
 // The light inside a cab relative to the average light outside: a bus's big windows let in
@@ -423,6 +474,20 @@ const ENVMAP_LIT_GLASS: bool = true;
 const ENVMAP_LIT_PAINT: bool = false;
 const ENVMAP_LIT_GAIN: f32 = 1.0;
 // [ROLLBACK envmap-39 end]
+
+// [ROLLBACK reflect-111] How much a coloured, light surface reflects against a black one: a black
+// element with a reflection map is a very reflective one (the author put the map on it for that),
+// a coloured one - a stripe painted on a pane, the paint of a body - is not, and the clear glass
+// between is the other end. The reflection (f0) of a surface whose texture is lighter than
+// REFL_DARK_LUM falls towards REFL_COLOURED (a share of the black's) at REFL_LIGHT_LUM; the part
+// of a pane's texture that is painted (its alpha over REFL_PAINT_ALPHA) counts as paint: it takes
+// the paint's rougher gloss (REFL_PAINT_ROUGH) too, so that a pane painted black looks as black
+// paint does. REFL_COLOURED 1.0 = off (as before).
+const REFL_COLOURED: f32 = 0.35;
+const REFL_DARK_LUM: f32 = 0.06;
+const REFL_LIGHT_LUM: f32 = 0.45;
+const REFL_PAINT_ALPHA: f32 = 0.5;
+const REFL_PAINT_ROUGH: f32 = 0.22;
 
 // How far the puddle threshold drops with the wetness: see the puddle mask in `shade_enhanced`.
 const PUDDLE_SPREAD: f32 = 0.45;
@@ -789,6 +854,12 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     var metal = 0.0;
     var f0 = vec3<f32>(0.04);
     var rough = 0.8;
+    // [ROLLBACK reflect-111] the share of its reflection a surface of this colour keeps
+    let pigment_lum = dot(tex.rgb * material.color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let pigment = mix(1.0, REFL_COLOURED, smoothstep(REFL_DARK_LUM, REFL_LIGHT_LUM, pigment_lum));
+    // [ROLLBACK reflect-113] how much of a glass material's texture is paint (opaque): that part is shaded
+    // and reflects as the same colour on any other envmapped material does (see the glass branch)
+    var painted = 0.0;
     if (terrain) {
         rough = 0.92;
         f0 = vec3<f32>(0.03);
@@ -802,6 +873,18 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // (0.4 on the Scania's panes). Up to 26 % as before, every window of every bus
         // was a mirror - far more than the original's panes reflect (issue #176).
         f0 = vec3<f32>(clamp(0.04 + 0.08 * min(material.params2.y, 1.0), 0.04, 0.12));
+        // [ROLLBACK reflect-113] where the pane's texture is paint (opaque, `diffuse_a`), it is shaded and
+        // reflects exactly as the envmapped paint of the next branch does: the same F0 and roughness
+        // from the same mask and factor (before 111: the glass's own, and a black pane stood out grey
+        // from the black round it, which has the same envmap without `[matl_alpha] 2`)
+        painted = smoothstep(REFL_PAINT_ALPHA - 0.15, REFL_PAINT_ALPHA + 0.25, diffuse_a * material.color.a);
+        let g_masked = (u32(material.params2.w + 0.5) & 1u) != 0u;
+        let g_metal_ok = (u32(material.params2.w + 0.5) & 4u) != 0u;
+        let g_refl = clamp(min(material.params2.y, 1.0) * reflection_mask(duv, diffuse_a), 0.0, 1.0);
+        let g_f0 = max(clamp(g_refl, 0.02, 0.08), ENVMAP_F0_MAX * smoothstep(0.3, 1.0, g_refl)) * pigment;
+        let g_rough = max(0.3 - 0.12 * smoothstep(0.0, 0.25, g_refl), select(0.22, 0.0, g_masked || g_metal_ok));
+        rough = mix(rough, g_rough, painted);
+        f0 = mix(f0, vec3<f32>(g_f0), painted);
     } else if (reflective_env) {
         // Paint reflects its few per cent through a smooth clear coat; much more than a few
         // per cent is polished metal - but only where the model says so with a mask of its
@@ -814,7 +897,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         metal = select(0.0, smoothstep(0.3, 0.85, refl), masked || metal_ok);
         // [ROLLBACK envmap-39] before: f0 = mix(vec3<f32>(clamp(refl, 0.02, 0.08)), ...)
         let paint_f0 = max(clamp(refl, 0.02, 0.08), ENVMAP_F0_MAX * smoothstep(0.3, 1.0, refl));
-        f0 = mix(vec3<f32>(paint_f0), mix(albedo, vec3<f32>(1.0), 0.4) * refl, metal);
+        f0 = mix(vec3<f32>(paint_f0) * pigment, mix(albedo, vec3<f32>(1.0), 0.4) * refl, metal);
         rough = mix(max(0.3 - 0.12 * smoothstep(0.0, 0.25, refl), select(0.22, 0.0, masked || metal_ok)), 0.14, metal);
     } else if (!thin && material.specular.w > 0.0 && dot(material.specular.rgb, vec3<f32>(1.0)) > 0.05) {
         // the o3d material's Blinn-Phong power as GGX roughness
@@ -943,7 +1026,8 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     var direct = vec3<f32>(0.0);
     if (enh.lights.w > 0.0 && max(enh.sun.r, enh.sun.g) > 1e-5) {
         var shadow = 0.0;
-        if (glass && nl > 0.0) {
+        // [ROLLBACK sharp-114] before: `glass && nl > 0.0` (the painted part of a pane had the hard shadow)
+        if (glass && painted < 0.5 && nl > 0.0) {
             // a pane lets nearly all of it through: the sun on it is its glint, for which one
             // compare says enough (the soft filter over a cab's windscreen, doors and side
             // windows was a millisecond of the frame)
@@ -990,8 +1074,9 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // not inherit occlusion belonging to geometry on the far side of the window.
     // (nor any other blended surface: a van's translucent door showed the shade of what
     // stood behind it)
+    // [ROLLBACK sharp-114] before: `ao = 1.0` - the painted part of a pane keeps its occlusion, as paint does
     if (glass || mode > 1.5) {
-        ao = 1.0;
+        ao = select(1.0, mix(1.0, ao, painted), glass);
     }
     ao = ao * pbr_ao;
     let fr = f_schlick(f0, nv);
@@ -1018,7 +1103,13 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // puddle a blurred picture of it (panes, envmapped paint and still water keep their own
     // smoothness). Its reflection is taken this rough, at this share.
     let wet_only = !(reflective_env || glass || is_water || ((material.pbr.z > 0.5 || material.pbr.w > 0.5) && !terrain));
-    let refl_rough = select(rough, max(rough, mix(0.35, 0.16, puddle)), wet_only);
+    var refl_rough = select(rough, max(rough, mix(0.35, 0.16, puddle)), wet_only);
+    // [ROLLBACK sharp-114] only a coloured surface blurs its reflection (the gloss of a painted body): a black
+    // or clear one - paint, pane, a pane's black stripes alike - mirrors as sharply as glass does
+    if ((glass || reflective_env) && !terrain && !is_water && metal < 0.5) {
+        let colouredness = smoothstep(REFL_DARK_LUM, REFL_LIGHT_LUM, pigment_lum);
+        refl_rough = mix(min(refl_rough, 0.04), refl_rough, colouredness);
+    }
     let wet_share = select(1.0, mix(0.35, 0.6, puddle), wet_only);
     let lod = refl_rough * (enh.lights.x - 1.0);
     var env = textureSampleLevel(t_probe, s_lin, to_cube(r), lod).rgb * enh.fog_color.w;
@@ -1085,7 +1176,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // (with the mip level its footprint needs on top of the blur: a fixed level showed
         // the photo's trees as contour lines across a car's curved bonnet close up, and
         // paint takes it as blurred as the vanilla path does)
-        let photo = textureSampleBias(t_env, s_diffuse, env_uv, max(rough * 16.0, select(2.0, 0.0, glass))).rgb;
+        let photo = textureSampleBias(t_env, s_diffuse, env_uv, max(refl_rough * 16.0, select(2.0, 0.0, glass))).rgb;
         let photo_avg = textureSampleLevel(t_env, s_diffuse, vec2<f32>(0.5, 0.5), 12.0).rgb;
         let lum_avg = max(dot(photo_avg, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.02);
         // (a tint, not a picture: an unbounded ratio drew the photo's trees as bands)
@@ -1131,7 +1222,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     if (glass) {
         // Transparent bus panes need a readable outside reflection from the driver's
         // viewpoint; opaque paint must never receive this boost.
-        refl_f = refl_f * 0.75 * (1.0 - 0.85 * own_pane * select(1.0, 1.0 - cab_mirror, cab_pane));
+        refl_f = refl_f * mix(0.75, 1.0, painted) * (1.0 - 0.85 * own_pane * select(1.0, 1.0 - cab_mirror, cab_pane));
     }
     var reflection = select(vec3<f32>(0.0), (env + env_lit) * refl_f, reflects);
     // Enhanced+: traced instead (rough surfaces keep the probe, which is as good as a
@@ -1141,8 +1232,12 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // [ROLLBACK envmap-39] before: `&& !paint &&` (a paint was never traced)
     // [ROLLBACK rtsplit-40] before: `camera.clouds.w > 1.5 &&` - every Enhanced+ frame traced every reflecting surface.
     // clouds.w 2: the traced lighting, with no reflections but the wet roads' (a ray tracing build has no puddle
-    // pass), 3: also those of the player's vehicle, 4: those of every surface (Settings: Ray traced reflections).
-    let rt_refl_here = camera.clouds.w > 3.5 || (camera.clouds.w > 1.5 && wet_road > 0.0) || (camera.clouds.w > 2.5 && near_player_vehicle(in.world) > 0.5);
+    // pass), 3: also those of the player's vehicle and the sections coupled to it ([ROLLBACK rtparts-120]: the first section only
+    // before), 4: those of every surface (Settings: Ray traced reflections).
+    let rt_refl_here = camera.clouds.w > 3.5 || (camera.clouds.w > 1.5 && wet_road > 0.0) || (camera.clouds.w > 2.5 && near_player_train(in.world) > 0.5);
+    // [ROLLBACK cover-115] how much of what lies under a blended layer it covers (0: opaque pipelines replace
+    // the picture, a vehicle's shadow blob and a painted ground leave the reflection as it is)
+    let rt_cover = select(0.0, clamp(alpha, 0.0, 1.0), mode > 1.5 && !terrain && in.params2.w < 1.5 && !capture);
     let traced = rt_refl_here && reflects && !(paint && !ENVMAP_TRACED) && refl_rough < 0.75 && !capture;
     if (traced) {
         var w = dot(refl_f, vec3<f32>(0.2126, 0.7152, 0.0722)) * aer.a;
@@ -1155,10 +1250,22 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         let rough_t = refl_rough;
         if (w > 0.002) {
             reflection = vec3<f32>(0.0);
-            rt_gbuf = vec4<f32>(n * w, w);
+            // [ROLLBACK cover-115] the alpha written is the layer's coverage, which is what a blended layer
+            // takes of the reflection of the layer under it (before: `w`, its weight); the weight is the
+            // length of the vector, see rt_reflect
+            rt_gbuf = vec4<f32>(n * w, select(w, rt_cover, rt_cover > 0.0));
             // (z: 0, or 1 + the cabin lamps' light for an own pane that mirrors the cabin, see rt_reflect)
-            rt_aux = vec4<f32>(dist * w, rough_t * w, select(0.0, (1.0 + cab_lamp) * w, cab_pane), w);
+            rt_aux = vec4<f32>(dist * w, rough_t * w, select(0.0, (1.0 + cab_lamp) * w, cab_pane), select(w, rt_cover, rt_cover > 0.0));
+        } else if (rt_cover > 0.0) {
+            rt_gbuf = vec4<f32>(0.0, 0.0, 0.0, rt_cover);
+            rt_aux = vec4<f32>(0.0, 0.0, 0.0, rt_cover);
         }
+    } else if (rt_cover > 0.0) {
+        // [ROLLBACK cover-115] a blended layer that does not reflect (no envmap: the copy of a layer under it
+        // that has one, a second material on a black base) covers the reflection of what lies under it as
+        // far as it is there, as it covers its colour; before it left it standing on the layer
+        rt_gbuf = vec4<f32>(0.0, 0.0, 0.0, rt_cover);
+        rt_aux = vec4<f32>(0.0, 0.0, 0.0, rt_cover);
     }
     // --- the lamps, the cabin light and what glows by itself
     // ([nomaplighting] objects are not lit by the map's lamps; light-mapped roads are, with
@@ -1269,8 +1376,10 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // of its own keeps its colour and its `emit` as they were before devtools-38.
     let own_light = material.params2.x > 0.5 || material.extra.w > 0.5 || material.emissive.w < -0.5;
     if (glass && !own_light) {
-        rgb = (direct + ambient) * pre;
-        emit = vec3<f32>(0.0);
+        // ([ROLLBACK reflect-113] the painted part of the pane keeps the lamps and what it glows with,
+        // as the paint round it does)
+        rgb = mix((direct + ambient) * pre, rgb, painted);
+        emit = emit * painted;
     }
     // [ROLLBACK glass-38 end]
     rgb = rgb + emit;

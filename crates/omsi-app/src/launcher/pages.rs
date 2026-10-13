@@ -313,6 +313,12 @@ pub const SETTINGS_TABS: [&str; 6] = ["Graphics", "Driving", "Camera", "Sound", 
 struct Outside {
     reset: bool,
     controls: Option<usize>,
+    /// [ROLLBACK gameplay-99] The duty's cars around and passengers switch (the launcher keeps
+    /// them with the start's choices, not with the settings); `choice_changed` once one was
+    /// touched.
+    traffic: f32,
+    passengers: bool,
+    choice_changed: bool,
 }
 
 thread_local! {
@@ -333,7 +339,7 @@ pub fn settings(l: &mut Launcher, area: Rect) {
     let body = Rect::new(body.x, bar.bottom() + 18.0, body.w, (body.bottom() - bar.bottom() - 18.0).max(0.0));
     let s = &mut l.state.settings;
     let dirty = &mut l.state.settings_dirty;
-    let mut out = Outside { reset: false, controls: None };
+    let mut out = Outside { reset: false, controls: None, traffic: l.state.choice.traffic, passengers: l.state.choice.passengers, choice_changed: false };
     // (two columns side by side; where they would be too narrow to read - a phone - one
     // under the other, each as high as it was the frame before)
     let stacked = body.w < 900.0;
@@ -356,6 +362,11 @@ pub fn settings(l: &mut Launcher, area: Rect) {
         });
         h
     });
+    if out.choice_changed {
+        l.state.choice.traffic = out.traffic;
+        l.state.choice.passengers = out.passengers;
+        l.state.touched();
+    }
     if out.reset {
         l.pages.confirm_reset = true;
     }
@@ -438,7 +449,7 @@ fn settings_tab(ui: &mut Ui, tab: usize, s: &mut Value, dirty: &mut f32, out: &m
         1 => driving_tab(ui, s, dirty, out, cols),
         2 => camera_tab(ui, s, dirty, out, cols),
         3 => sound_tab(ui, s, dirty, cols),
-        4 => gameplay_tab(ui, s, dirty, cols),
+        4 => gameplay_tab(ui, s, dirty, out, cols),
         _ => general_tab(ui, s, dirty, out, cols),
     }
 }
@@ -934,7 +945,6 @@ fn sound_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) -> [f
         }
     }
     toggle_setting(ui, s, dirty, c.row(), "Doppler effect", "doppler");
-    sel_setting(ui, s, dirty, "s-voices", c.row(), "Passenger voices", "pax_voices", &[("all", "Greetings and tickets"), ("tickets", "Only the ticket asked for"), ("off", "Silent")]);
     c.section(ui, "Radio effects");
     c.y += ui.paragraph("Optional character for the bus radio, all off by default. The radio plays from the cab by the driver's seat.", Vec2::new(c.inner.x, c.y), c.inner.w, 12.5, Weight::Regular, TEXT_DIM) + 8.0;
     for (key, label, id) in [("radio_fx_speaker", "Cheap speaker", "s-fx-spk"), ("radio_fx_noise", "FM hiss and crackle", "s-fx-noise"), ("radio_fx_dropouts", "Lost reception", "s-fx-drop")] {
@@ -988,10 +998,18 @@ fn radio_stations(ui: &mut Ui, r: Rect) -> f32 {
 }
 
 /// How the world behaves: passengers, traffic, collisions, wear, the clock.
-fn gameplay_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) -> [f32; 2] {
+fn gameplay_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, cols: [Rect; 2]) -> [f32; 2] {
     let mut c = Col::new(ui, cols[0], "Passengers");
+    // [ROLLBACK gameplay-99] (moved here from the start's "Day & weather" step)
+    if ui.toggle("set-start-passengers", c.row(), &mut out.passengers, "Passengers") {
+        out.choice_changed = true;
+    }
     sel_setting(ui, s, dirty, "s-board", c.row(), "Boarding", "boarding", &[("auto", "Pay and take the ticket"), ("pay", "The driver sells the ticket"), ("walk", "Just walk in")]);
     toggle_setting(ui, s, dirty, c.row(), "Passengers pay the exact fare", "exact_fare");
+    // [ROLLBACK paxvoice-99]
+    toggle_setting(ui, s, dirty, c.row(), "Passengers greet the driver", "pax_greet");
+    toggle_setting(ui, s, dirty, c.row(), "Passengers say which ticket they want", "pax_ticket");
+    toggle_setting(ui, s, dirty, c.row(), "Passengers complain", "pax_complain");
     toggle_setting(ui, s, dirty, c.row(), "Show a summary after each trip", "trip_summary");
     let mut pd = get(s, "pax_density").as_f64().unwrap_or(1.0) as f32;
     if ui.slider("s-pax", c.row(), &mut pd, 0.0, 2.0, 0.1, "How many passengers", &|v| format!("{:.0}%", v * 100.0)) {
@@ -1004,11 +1022,15 @@ fn gameplay_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
         s["pax_sit"] = json!((ps * 20.0).round() / 20.0);
         *dirty = 0.3;
     }
-    toggle_setting(ui, s, dirty, c.row(), "Ability to get up (Ctrl+Shift+G)", "get_up");
+    // [ROLLBACK petrol-93]
+    toggle_setting(ui, s, dirty, c.row(), "Refuel and wash anywhere (no petrol station needed)", "skip_petrol_check");
     c.section(ui, "Traffic");
+    if ui.slider("s-start-traffic", c.row(), &mut out.traffic, 0.0, 120.0, 1.0, "Cars around", &|v| format!("{v:.0}")) {
+        out.choice_changed = true;
+    }
     sel_setting(ui, s, dirty, "s-unsched", c.row(), "Random traffic", "ai_unsched_factor", &[("25", "25%"), ("50", "50%"), ("75", "75%"), ("100", "100%"), ("150", "150%"), ("200", "200%")]);
-    sel_setting(ui, s, dirty, "s-maxsched", c.row(), "Timetable vehicles", "ai_max_scheduled", &[("0", "All"), ("10", "At most 10"), ("25", "At most 25"), ("50", "At most 50")]);
-    sel_setting(ui, s, dirty, "s-maxpark", c.row(), "Parked cars", "ai_max_parked", &[("-1", "None"), ("0", "Every space"), ("35", "At most 35"), ("100", "At most 100"), ("250", "At most 250")]);
+    sel_setting(ui, s, dirty, "s-maxsched", c.row(), "Max timetable vehicles", "ai_max_scheduled", &[("0", "All"), ("10", "At most 10"), ("25", "At most 25"), ("50", "At most 50")]);
+    sel_setting(ui, s, dirty, "s-maxpark", c.row(), "Parked cars", "ai_parked_pct", &[("0", "None"), ("25", "25% of spaces"), ("50", "50% of spaces"), ("75", "75% of spaces"), ("90", "90% of spaces"), ("100", "Every space")]);
     let left = c.used();
     // OMSI's own options (options.cfg)
     let mut c = Col::new(ui, cols[1], "Simulation");
@@ -1069,6 +1091,9 @@ fn general_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, c
     );
     c.y += help_height + 3.0;
     toggle_setting(ui, s, dirty, c.row(), "Open Developer Tools with every session", "developer_tools");
+    // [ROLLBACK tabs-119] the tabs the left rail hides until asked for
+    toggle_setting(ui, s, dirty, c.row(), "Show the Mods tab", "show_mods_tab");
+    toggle_setting(ui, s, dirty, c.row(), "Show the Timetable tab", "show_timetable_tab");
     // (the texts over the picture, the menu, the timetable and the navigator: larger for
     // those who find them hard to read, smaller for more of the picture; on a window taller
     // than 1080p they grow with it as well, and the launcher grows with its window anyway)
@@ -1215,7 +1240,10 @@ fn known_action(a: &str) -> Option<String> {
         ("view_set_outside", "Outside view"),
         ("view_toggle_viewpoint", "Next view"),
         ("view_toggle_interior", "Cabin and outside, one key"),
+        ("view_zoom_in", "Zoom the view in (hold)"),
+        ("view_zoom_out", "Zoom the view out (hold)"),
         ("view_toggle_gui", "Show / hide the interface (map, notes, ...)"),
+        ("walk_getup", "Get up from the driver's seat"),
         ("walk_forward", "On foot: forward"),
         ("walk_back", "On foot: back"),
         ("walk_left", "On foot: left"),
@@ -2709,9 +2737,9 @@ mod settings_tests {
             camera.extend(["set-vr", "s-vr-scale", "s-vr-head-smoothing", "s-vr-mirror-rate", "set-vr_desktop_mirror", "s-go-vr-keys"]);
         }
         // (the radio stations: one, see `frame`)
-        let sound = vec!["s-vol", "s-volai", "s-volsc", "set-doppler", "s-voices", "radio-name-0", "radio-url-0", "radio-del-0", "radio-add"];
+        let sound = vec!["s-vol", "s-volai", "s-volsc", "set-doppler", "radio-name-0", "radio-url-0", "radio-del-0", "radio-add"];
         let gameplay = vec![
-            "s-board", "set-exact_fare", "set-trip_summary", "s-pax", "set-get_up", "s-unsched", "s-maxsched", "s-maxpark",
+            "set-start-passengers", "s-board", "set-exact_fare", "set-pax_greet", "set-pax_ticket", "set-pax_complain", "set-trip_summary", "s-pax", "set-skip_petrol_check", "s-start-traffic", "s-unsched", "s-maxsched", "s-maxpark",
             "s-maint", "set-collision_vehicles", "set-collision_objects", "set-collision_pedestrians", "set-use_real_date", "set-time_sync", "set-metar_sync", "s-timespeed",
         ];
         let general = vec![
@@ -2732,7 +2760,7 @@ mod settings_tests {
     }
 
     fn outside() -> Outside {
-        Outside { reset: false, controls: None }
+        Outside { reset: false, controls: None, traffic: 30.0, passengers: true, choice_changed: false }
     }
 
     /// One frame of tab `tab`, its two columns tall enough that nothing is cut off. The Sound

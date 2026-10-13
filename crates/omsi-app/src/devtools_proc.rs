@@ -9,7 +9,8 @@
 //! * window → game: `hello` (the window is up: send everything), `view <key> <0|1>` (an
 //!   overlay on or off), `watch|unwatch <v|s> <name>` (a variable of the player's vehicle to
 //!   show: `v` numeric, `s` string), `set <v|s> <name> <value>` (write it once),
-//!   `hold <v|s> <name> <value>` (write it every frame) and `release <v|s> <name>`;
+//!   `hold <v|s> <name> <value>` (write it every frame) and `release <v|s> <name>`, and
+//!   `tune <key> <value>` (a value of the AI avoidance, see `traffic::TUNE`);
 //! * game → window: `view <key> <0|1>`, `vehicle <name>`, `names_begin` / `name <v|s> <name>` /
 //!   `names_end` (all the variables of the player's vehicle), `watched <v|s> <name>`,
 //!   `held <v|s> <name> <value>` and `val <v|s> <name> <value>` (the watched ones, five times
@@ -25,8 +26,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 /// The overlays the tools window switches (the keys are the protocol's).
-pub(crate) const VIEW_KEYS: [&str; 12] = [
+pub(crate) const VIEW_KEYS: [&str; 16] = [
     "seats", "standing", "paths", "pathlabels", "devices", "boxes", "axles", "cog", "lights", "mirrors", "viewsdriver", "viewspax",
+    // [ROLLBACK aidebug-89] the AI debug page
+    "aihumans", "aipaths", "aicars", "aicolls",
 ];
 
 #[derive(Default, Clone, Copy)]
@@ -43,11 +46,17 @@ pub(crate) struct DevView {
     pub mirrors: bool,
     pub viewsdriver: bool,
     pub viewspax: bool,
+    /// [ROLLBACK aidebug-89] AI debug: what every person does, their planned ways, the cars'
+    /// ways, what the cars see.
+    pub aihumans: bool,
+    pub aipaths: bool,
+    pub aicars: bool,
+    pub aicolls: bool,
 }
 
 impl DevView {
     pub fn any(&self) -> bool {
-        self.seats || self.standing || self.paths || self.boxes || self.axles || self.lights || self.pathlabels || self.devices || self.cog || self.mirrors || self.viewsdriver || self.viewspax
+        self.seats || self.standing || self.paths || self.boxes || self.axles || self.lights || self.pathlabels || self.devices || self.cog || self.mirrors || self.viewsdriver || self.viewspax || self.aihumans || self.aipaths || self.aicars || self.aicolls
     }
 
     fn set(&mut self, key: &str, on: bool) {
@@ -64,6 +73,10 @@ impl DevView {
             "mirrors" => self.mirrors = on,
             "viewsdriver" => self.viewsdriver = on,
             "viewspax" => self.viewspax = on,
+            "aihumans" => self.aihumans = on,
+            "aipaths" => self.aipaths = on,
+            "aicars" => self.aicars = on,
+            "aicolls" => self.aicolls = on,
             _ => {}
         }
     }
@@ -82,6 +95,10 @@ impl DevView {
             "mirrors" => self.mirrors,
             "viewsdriver" => self.viewsdriver,
             "viewspax" => self.viewspax,
+            "aihumans" => self.aihumans,
+            "aipaths" => self.aipaths,
+            "aicars" => self.aicars,
+            "aicolls" => self.aicolls,
             _ => false,
         }
     }
@@ -115,9 +132,60 @@ pub(crate) struct DevToolsProc {
     /// What the window asked to be read again, not yet done (see `take_reloads`).
     reloads: Vec<crate::humans::CabinReload>,
     file_reloads: Vec<FileKind>,
+    /// [ROLLBACK aidebug-89] Seconds to the next AI page update, and what it said last.
+    sign_t: f32,
+    sign_last: String,
+    /// [ROLLBACK payload-121] What the window asked for with the Actions buttons (`fill_standing`, `fill_seats`,
+    /// `clear`), not yet done, and the weights line last sent.
+    pax_actions: Vec<String>,
+    weights_t: f32,
+    weights_last: String,
 }
 
 impl DevToolsProc {
+    /// [ROLLBACK aidebug-89] The AI debug page's lines (what the player's bus shows and how the
+    /// people at the stop take it) to the window, five times a second and only when they
+    /// changed; `lines` is not asked for when no window is open.
+    pub fn send_sign(&mut self, dt: f32, lines: impl FnOnce() -> Vec<String>) {
+        if self.child.is_none() || self.tx.is_none() {
+            return;
+        }
+        self.sign_t -= dt;
+        if self.sign_t > 0.0 {
+            return;
+        }
+        self.sign_t = 0.2;
+        let text = lines().iter().map(|l| clean(l)).collect::<Vec<_>>().join("\u{1f}");
+        if text != self.sign_last {
+            self.send(format!("aisign\t{text}"));
+            self.sign_last = text;
+        }
+    }
+
+    /// [ROLLBACK payload-121] The weights of the player's vehicle (own, passengers; kg) to the window, five times
+    /// a second and only when they changed.
+    pub fn send_weights(&mut self, dt: f32, own_and_pax: Option<(f32, f32)>) {
+        if self.child.is_none() || self.tx.is_none() {
+            return;
+        }
+        self.weights_t -= dt;
+        if self.weights_t > 0.0 {
+            return;
+        }
+        self.weights_t = 0.2;
+        let (own, pax) = own_and_pax.unwrap_or((0.0, 0.0));
+        let text = format!("{:.0}\t{:.0}\t{:.0}", own, pax, own + pax);
+        if text != self.weights_last {
+            self.send(format!("weights\t{text}"));
+            self.weights_last = text;
+        }
+    }
+
+    /// [ROLLBACK payload-121] The passenger actions the window asked for since the last call.
+    pub(crate) fn take_pax_actions(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pax_actions)
+    }
+
     /// Open the tools window, unless one is running. A window the user has closed is replaced.
     pub fn start(&mut self) {
         if let Some(c) = self.child.as_mut() {
@@ -316,6 +384,7 @@ pub(crate) fn tick(dev: &mut DevToolsProc, mut player: Option<&mut crate::player
                 dev.holds.retain(|h| !(h.0 == is_str && h.1 == name));
                 dev.holds.push((is_str, name.to_string(), f[3].to_string()));
             }
+            "act" if f.len() >= 2 => dev.pax_actions.push(f[1].to_string()),
             "reload" if f.len() >= 2 => match f[1] {
                 "cabin" => dev.reloads.push(crate::humans::CabinReload::Cabin),
                 "paths" => dev.reloads.push(crate::humans::CabinReload::Paths),
@@ -344,14 +413,25 @@ pub(crate) fn tick(dev: &mut DevToolsProc, mut player: Option<&mut crate::player
                 }
             }
             "release" if f.len() >= 3 => dev.holds.retain(|h| !(h.0 == is_str && h.1 == name)),
+            // [ROLLBACK tune-104] a slider of the AI avoidance
+            "tune" if f.len() >= 3 => {
+                if let Ok(v) = f[2].trim().replace(',', ".").parse::<f32>() {
+                    crate::traffic::set_tune(f[1], v);
+                }
+            }
             _ => {}
         }
     }
     if dev.resync {
         dev.resync = false;
         dev.names_of = 0;
+        dev.sign_last.clear();
+        dev.weights_last.clear();
         for key in VIEW_KEYS {
             dev.send(format!("view\t{key}\t{}", dev.view.get(key) as u8));
+        }
+        for (k, t) in crate::traffic::TUNE.iter().enumerate() {
+            dev.send(format!("tune\t{}\t{}", t.0, crate::traffic::tune(k)));
         }
         for (s, n) in &dev.watch {
             dev.send(format!("watched\t{}\t{}", if *s { "s" } else { "v" }, clean(n)));
@@ -455,11 +535,25 @@ impl Projector {
     }
 }
 
+/// [ROLLBACK pathid-117] The colour of a vehicle section's paths and points in the picture (front section first).
+fn section_colour(section: usize) -> [u8; 4] {
+    const COLOURS: [[u8; 4]; 6] = [
+        [70, 235, 110, 255],
+        [255, 150, 40, 255],
+        [70, 170, 255, 255],
+        [255, 90, 160, 255],
+        [235, 225, 60, 255],
+        [170, 120, 255, 255],
+    ];
+    COLOURS[section % COLOURS.len()]
+}
+
 /// The dots and lines the window asked for, over the picture of this frame.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn marks(
     view: &DevView,
-    humans: Option<&mut crate::humans::Humans>,
+    mut humans: Option<&mut crate::humans::Humans>,
+    traffic: Option<&crate::traffic::Traffic>,
     player: &crate::player::Player,
     cam: &omsi_render::Camera,
     width: f32,
@@ -484,11 +578,21 @@ pub(crate) fn marks(
         }
     };
     if view.seats || view.standing || view.paths || view.pathlabels || view.devices {
-        if let Some(c) = humans.and_then(|h| h.debug_cabin(&player.vehicle)) {
+        if let Some(c) = humans.as_deref_mut().and_then(|h| h.debug_cabin(&player.vehicle)) {
             if view.paths {
                 for (a, b) in &c.links {
                     if let (Some(pa), Some(pb)) = (c.points.get(*a), c.points.get(*b)) {
-                        line(&mut out, *pa, *pb, [70, 235, 110, 255], 1.6);
+                        // [ROLLBACK pathid-117] a colour a section; a link between two sections white
+                        let (sa, sb) = (
+                            c.sections.get(*a).copied().unwrap_or(0),
+                            c.sections.get(*b).copied().unwrap_or(0),
+                        );
+                        let (rgba, size) = if sa == sb {
+                            (section_colour(sa), 1.6)
+                        } else {
+                            ([255, 255, 255, 255], 2.6)
+                        };
+                        line(&mut out, *pa, *pb, rgba, size);
                     }
                 }
             }
@@ -497,7 +601,7 @@ pub(crate) fn marks(
                     let role = c.roles.get(i).cloned().unwrap_or_default();
                     // what the point is for, and the colour of the strongest use
                     let mut tags: Vec<String> = Vec::new();
-                    let mut rgba = [70, 235, 110, 255];
+                    let mut rgba = section_colour(c.sections.get(i).copied().unwrap_or(0));
                     let mut size = 2.5;
                     for (n, no_sale, button) in &role.entries {
                         tags.push(format!(
@@ -535,7 +639,9 @@ pub(crate) fn marks(
                     }
                     if view.pathlabels {
                         if let Some((pm, true)) = screen(*p) {
-                            let text = if tags.is_empty() { format!("{i}") } else { format!("{i}: {}", tags.join(", ")) };
+                            // (the point's number in its own section's paths.cfg)
+                            let id = c.local.get(i).copied().unwrap_or(i);
+                            let text = if tags.is_empty() { format!("{id}") } else { format!("{id}: {}", tags.join(", ")) };
                             out.push(Mark { p: pm, to: None, rgba, size, label: Some(text) });
                         }
                     } else {
@@ -736,6 +842,212 @@ pub(crate) fn marks(
             let blue = [150, 220, 255, 255];
             line(&mut out, at, at + (dir_of(yaw, pitch) * 0.6).as_dvec3(), [255, 255, 255, 255], 2.4);
             label_at(&mut out, at, blue, 5.0, format!("mirror {n}{}", if c.fixed { " (static)" } else { "" }));
+        }
+    }
+
+    // [ROLLBACK aidebug-89] --- the AI debug page: people and cars around the camera
+    let stack = |out: &mut Vec<Mark>, at: DVec3, rgba: [u8; 4], lines: &[String]| {
+        if let Some(((x, y), true)) = screen(at) {
+            let n = lines.len();
+            for (k, text) in lines.iter().enumerate() {
+                out.push(Mark { p: (x, y - (n - k) as f32 * 14.0), to: None, rgba, size: if k == 0 { 3.0 } else { 0.0 }, label: Some(text.clone()) });
+            }
+        }
+    };
+    if view.aihumans || view.aipaths {
+        if let Some(h) = humans.as_deref() {
+            let net = traffic.map(|t| &t.net);
+            for n in h.debug_npcs(net, cam.position, 70.0) {
+                if view.aipaths && n.path.len() >= 2 {
+                    for w in n.path.windows(2) {
+                        line(&mut out, w[0], w[1], n.rgba, 1.8);
+                    }
+                    if let Some(end) = n.path.last() {
+                        dot(&mut out, *end, n.rgba, 4.0);
+                    }
+                }
+                if view.aihumans {
+                    let far = (n.at - cam.position).length() > 25.0;
+                    let keep = if far { 2 } else { n.lines.len() };
+                    stack(&mut out, n.at, n.rgba, &n.lines[..keep.min(n.lines.len())]);
+                }
+            }
+        }
+    }
+    if view.aicars || view.aicolls {
+        if let Some(t) = traffic {
+            let by_id: std::collections::HashMap<u64, DVec3> = t.cars.iter().map(|c| (c.id, c.vehicle.position)).collect();
+            let lift = DVec3::new(0.0, 0.0, 0.4);
+            for c in &t.cars {
+                let pos = c.vehicle.position;
+                if (pos - cam.position).length() > 160.0 {
+                    continue;
+                }
+                let held = c.held || c.light_hold || c.yielding;
+                if view.aicars {
+                    // the lanes ahead: this one from where it is, then the ones chosen
+                    let st = &c.state;
+                    let mut lanes = vec![st.lane];
+                    if st.route.is_empty() {
+                        lanes.extend(st.planned_next);
+                        lanes.extend(st.ahead.iter().copied());
+                    } else {
+                        lanes.extend(st.route.iter().skip(st.route_index + 1).copied());
+                    }
+                    let rgba = if held { [255, 150, 60, 255] } else { [80, 220, 255, 255] };
+                    let (mut prev, mut left) = (pos + lift, 140.0f32);
+                    for (k, l) in lanes.iter().enumerate() {
+                        let Some(lane) = t.net.lanes.get(*l) else { break };
+                        let len = lane.length();
+                        let mut s = if k == 0 { st.s.min(len) } else { 0.0 };
+                        while s < len && left > 0.0 {
+                            let q = lane.at(s).0 + lift;
+                            line(&mut out, prev, q, rgba, 1.8);
+                            prev = q;
+                            s += 4.0;
+                            left -= 4.0;
+                        }
+                        let q = lane.at(len).0 + lift;
+                        line(&mut out, prev, q, rgba, 1.8);
+                        prev = q;
+                    }
+                    dot(&mut out, prev, rgba, 4.0);
+                    let mut lines = vec![format!("#{} lane {} s {:.0} {:.1} m/s{}", c.id, st.lane, st.s, st.speed, if c.bus.is_some() { " [timetable bus]" } else { "" })];
+                    lines.push(format!("next {:?}, then {:?}{}", st.planned_next, st.ahead.iter().take(3).collect::<Vec<_>>(), if st.route.is_empty() { String::new() } else { format!(", route {}/{}", st.route_index + 1, st.route.len()) }));
+                    stack(&mut out, pos + DVec3::new(0.0, 0.0, 2.6), rgba, &lines);
+                }
+                if view.aicolls {
+                    let bb = c.vehicle.ty.def.bounding_box.unwrap_or([2.0, 4.5, 1.6, 0.0, 0.0, 0.8]);
+                    let o = omsi_sim::collision::Obb::from_box(bb, pos, c.vehicle.heading);
+                    let (r, f) = (glam::DVec2::new(o.heading.cos(), -o.heading.sin()), glam::DVec2::new(o.heading.sin(), o.heading.cos()));
+                    let z = pos.z + 0.5;
+                    let corner = |sx: f64, sy: f64| {
+                        let q = o.center + r * (o.half.x * sx) + f * (o.half.y * sy);
+                        DVec3::new(q.x, q.y, z)
+                    };
+                    let body = if held { [255, 60, 60, 255] } else { [90, 255, 120, 255] };
+                    let cs = [corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)];
+                    for k in 0..4 {
+                        line(&mut out, cs[k], cs[(k + 1) % 4], body, 1.8);
+                    }
+                    // what it sees ahead: the nearest constraint, as far as it reports it
+                    let front = o.center + f * o.half.y;
+                    if !c.why.0.is_empty() {
+                        let end = front + f * (c.why.1.clamp(0.0, 60.0) as f64);
+                        let (a, b) = (DVec3::new(front.x, front.y, z), DVec3::new(end.x, end.y, z));
+                        line(&mut out, a, b, [255, 230, 60, 255], 2.2);
+                        label_at(&mut out, b, [255, 230, 60, 255], 4.0, format!("{} {:.1} m", c.why.0, c.why.1));
+                    }
+                    if let Some((id, gap)) = c.lead_info {
+                        if let Some(q) = by_id.get(&id) {
+                            line(&mut out, pos + lift, *q + lift, [60, 160, 255, 255], 1.6);
+                            label_at(&mut out, (pos + *q) * 0.5 + lift, [60, 160, 255, 255], 3.0, format!("lead #{id}, gap {gap:.1} m"));
+                        }
+                    }
+                    if let Some(id) = c.geo_block {
+                        if let Some(q) = by_id.get(&id) {
+                            line(&mut out, pos + lift, *q + lift, [255, 60, 255, 255], 1.8);
+                            label_at(&mut out, (pos + *q) * 0.5 + lift, [255, 60, 255, 255], 3.0, format!("body of #{id} in the way"));
+                        }
+                    }
+                    if let Some(id) = c.squeeze {
+                        if let Some(q) = by_id.get(&id) {
+                            line(&mut out, pos + lift, *q + lift, [255, 170, 40, 255], 1.6);
+                        }
+                    }
+                    let mut flags: Vec<String> = Vec::new();
+                    if c.held {
+                        flags.push("held".into());
+                    }
+                    if c.light_hold {
+                        flags.push("red light".into());
+                    }
+                    if c.yielding {
+                        flags.push("yielding".into());
+                    }
+                    if c.stopped > 2.0 {
+                        flags.push(format!("stopped {:.0} s", c.stopped));
+                    }
+                    if let Some(h) = &c.holding {
+                        flags.push(h.clone());
+                    }
+                    if !flags.is_empty() {
+                        label_at(&mut out, pos + DVec3::new(0.0, 0.0, 1.6), body, 3.0, format!("#{}: {}", c.id, flags.join(", ")));
+                    }
+                    // [ROLLBACK avoiddbg-102] how the car goes round what stands in its way: which
+                    // fallback it uses (correction within the lane, or the overtake on the
+                    // oncoming lane), why the other did not start, the way it tried and the
+                    // ground it probed (green fine, red kerb, yellow drop, magenta no asphalt)
+                    let passing = c.passing.map(|p| !p.aborted).unwrap_or(false);
+                    if passing
+                        || c.squeeze_p.is_some()
+                        || c.stopped > 1.0
+                        || !c.avoid.cands.is_empty()
+                    {
+                        let (mode, rgba) = if passing {
+                            ("FALLBACK: OVERTAKE (oncoming lane)", [255, 150, 60, 255])
+                        } else if c.squeeze_p.is_some() {
+                            ("FALLBACK: CORRECTION (in the lane)", [90, 255, 120, 255])
+                        } else {
+                            ("FALLBACK: none yet", [255, 90, 90, 255])
+                        };
+                        let av = &c.avoid;
+                        // [ROLLBACK corridor-104] the correction's text in lines of 70 characters ([ROLLBACK deform-105]: the bend of the way)
+                        let (head, rest) = match av.squeeze.split_once("scanned") {
+                            Some((a, b)) => (
+                                a.trim_end_matches(|c| c == ' ' || c == ';').to_string(),
+                                format!("scanned{b}"),
+                            ),
+                            None => (av.squeeze.clone(), String::new()),
+                        };
+                        let mut lines = vec![
+                            mode.to_string(),
+                            format!("vehicle on the lane: {:.0} % of its width", av.frac * 100.0),
+                            format!("correction: {head}"),
+                        ];
+                        let mut row = String::new();
+                        for word in rest.split(' ') {
+                            if row.len() + word.len() > 70 && !row.is_empty() {
+                                lines.push(format!("  {row}"));
+                                row.clear();
+                            }
+                            if !row.is_empty() {
+                                row.push(' ');
+                            }
+                            row.push_str(word);
+                        }
+                        if !row.is_empty() {
+                            lines.push(format!("  {row}"));
+                        }
+                        lines.push(format!("overtake: {}", av.pass));
+                        stack(&mut out, pos + DVec3::new(0.0, 0.0, 3.6), rgba, &lines);
+                        // every sideways move it tried: the one chosen thick and bright green,
+                        // the others possible pale green, the vehicle in the way grey, bad ground
+                        // red, traffic orange
+                        for (verdict, pts) in &av.cands {
+                            let (col, width) = match verdict {
+                                0 => ([60, 255, 90, 255], 3.2),
+                                1 => ([150, 230, 160, 200], 1.2),
+                                2 => ([150, 150, 150, 150], 1.0),
+                                3 => ([255, 60, 60, 200], 1.2),
+                                _ => ([255, 160, 40, 220], 1.2),
+                            };
+                            for w in pts.windows(2) {
+                                line(&mut out, w[0] + lift, w[1] + lift, col, width);
+                            }
+                        }
+                        for (q, code) in &av.marks {
+                            let verdicts = [
+                                [90, 255, 120, 255],
+                                [255, 60, 60, 255],
+                                [255, 230, 60, 255],
+                                [255, 60, 255, 255],
+                            ];
+                            dot(&mut out, *q, verdicts[(*code as usize).min(3)], 3.0);
+                        }
+                    }
+                }
+            }
         }
     }
     out

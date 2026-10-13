@@ -263,7 +263,8 @@ fn save(app: &mut App, devices: Vec<DeviceCfg>) {
 
 pub(crate) fn run(app: &mut App, kind: &ListKind, action: &str, mv: Move) -> Option<ListKind> {
     let (verb, arg) = action.split_once(' ').unwrap_or((action, ""));
-    if action == "back" { return parent(kind); }
+    // [ROLLBACK declutter-126] the page of the keys and controllers is the Options' Controls tab
+    if action == "back" { return parent(kind).map(|p| if p == ListKind::Controls { ListKind::Options(crate::game_lists::options_tab(app, "Controls")) } else { p }); }
     if let ListKind::ControllerDevices(_) = kind {
         if crate::game_lists::option_do(app, verb, arg, mv) { return Some(kind.clone()); }
         if !matches!(mv, Move::Next) { return Some(kind.clone()); }

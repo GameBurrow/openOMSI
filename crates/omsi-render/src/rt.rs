@@ -88,7 +88,14 @@ struct Params {
     sun_light: [f32; 4],
     /// x 1: the sun's shadow is traced (0: only the occlusion is; the shadow map holds the shadows)
     flags: [f32; 4],
+    /// [ROLLBACK rtspot-112] the spot lights nearest the camera, two entries each: xyz the lamp
+    /// (render-origin relative) and w its range; xyz its direction and w the cosine of its
+    /// outer cone. The reflections leave out what they light (rt_reflect.wgsl `spot_lit`).
+    spots: [[f32; 4]; RT_SPOTS * 2],
 }
+
+/// How many spot lights the reflections know of (rt_reflect.wgsl `RT_SPOTS`).
+const RT_SPOTS: usize = 12;
 
 /// The traced lighting's textures for one picture size (all rgba16float: r the ambient
 /// occlusion, g the view depth it was traced at, b the sun's visibility (< 0: not traced),
@@ -492,6 +499,8 @@ impl Renderer {
                 }
             }
         }
+        // [ROLLBACK tree-rt-92] the camera is inside the player's vehicle (F1 / F2 views)
+        let in_cabin = lighting.inside.as_ref().is_some_and(|v| point_in_vehicle_box(camera.position, v));
         rt.to_build.clear();
         rt.records.clear();
         let mut chosen: Vec<(BlasKey, [f32; 12], u32, u8)> = Vec::new();
@@ -524,7 +533,17 @@ impl Renderer {
                     continue;
                 }
             }
-            let (solid, cut, glass) = Self::traced_ranges(scene, inst);
+            let (solid, mut cut, glass) = Self::traced_ranges(scene, inst);
+            // [ROLLBACK tree-rt-92] seen from inside the player's vehicle the crossed tree
+            // cards (which may stand in the road's clearance) are left out of the traced
+            // scene: a ray meeting one next to the windscreen made the reflections warp
+            if in_cabin && cut != 0 {
+                for (ri, (_, _, slot)) in m.ranges.iter().enumerate().take(64) {
+                    if cut & (1 << ri) != 0 && inst.materials.get(*slot as usize).and_then(|&id| scene.materials.get(id)).is_some_and(|mat| mat.is_tree()) {
+                        cut &= !(1 << ri);
+                    }
+                }
+            }
             if solid | cut | glass == 0 {
                 continue;
             }
@@ -675,6 +694,35 @@ impl Renderer {
             _ => ([0.0; 4], [0.0; 4], [0.0; 4], [0.0; 4]),
         };
         let debug = omsi_cfg::env::var("OMSI_DEBUG_RT").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+        // [ROLLBACK rtspot-112] the spot lights (vehicles' headlamps, beam cookies too) nearest the
+        // camera: the pools they lay on the road and the grass are not shown in the paint
+        let mut spots = [[0.0f32; 4]; RT_SPOTS * 2];
+        {
+            let mut near: Vec<(f32, &PointLight)> = scene
+                .lights
+                .iter()
+                .filter(|l| {
+                    l.radius > 0.0
+                        && l.intensity > 0.0
+                        && l.direction.length_squared() > 1e-6
+                        && l.mode != LightMode::Vanilla
+                })
+                .map(|l| ((l.position - ro).as_vec3().distance_squared(cam), l))
+                .collect();
+            near.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (k, (_, l)) in near.iter().take(RT_SPOTS).enumerate() {
+                let at = (l.position - ro).as_vec3();
+                let dir = l.direction.normalize();
+                // (a beam cookie reaches wider than its cone says)
+                let outer = if l.cookie > 0 {
+                    l.cone[1].min(0.5)
+                } else {
+                    l.cone[1]
+                };
+                spots[2 * k] = [at.x, at.y, at.z, l.radius];
+                spots[2 * k + 1] = [dir.x, dir.y, dir.z, outer];
+            }
+        }
         let p = Params {
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             view_proj: view_proj.to_cols_array_2d(),
@@ -691,6 +739,7 @@ impl Renderer {
             sky: [0.0; 4],
             sun_light: [0.0; 4],
             flags: [if self.options.rt_shadows { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            spots,
         };
         self.queue.write_buffer(&rt.params, 0, bytemuck::bytes_of(&p));
         rt.prev = Some((view_proj, ro, vehicle));

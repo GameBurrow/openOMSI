@@ -169,7 +169,7 @@ pub(crate) fn run_offscreen(
         h.exact_fare = settings.exact_fare;
         h.boarding = settings.boarding.clone();
         h.sit_bias = settings.pax_sit;
-        h.voices = match settings.pax_voices.as_str() { "off" => 2, "tickets" => 1, _ => 0 };
+        h.voices = settings.pax_voice_mask();
         if let Some(p) = player.as_mut() {
             h.set_cabin(&mut p.vehicle);
             h.ticket_key = ticket_key_name(&args.root, &p.bindings);

@@ -29,6 +29,9 @@ struct RtParams {
     sun_light: vec4<f32>,
     // x 1: the sun's shadow is traced (0: not: the shadow map holds it)
     flags: vec4<f32>,
+    // [ROLLBACK rtspot-112] the spot lights nearest the camera, two entries each: xyz the lamp
+    // and w its range; xyz its direction and w the cosine of its outer cone (rt.rs `RT_SPOTS`)
+    spots: array<vec4<f32>, 24>,
 };
 
 struct Record {

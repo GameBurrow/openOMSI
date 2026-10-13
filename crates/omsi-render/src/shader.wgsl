@@ -24,6 +24,7 @@ struct Camera {
     wind: vec4<f32>,         // the player's vehicle's velocity (m/s, world): the airstream on its glass
     light_view_proj_lamp: mat4x4<f32>, // the player's headlamps' shadow map (perspective), see `lamp_shadow`
     lamp: vec4<f32>,         // x 1 when the lamp shadow map was drawn this frame, y near, z far plane (m), w texel size
+    parts: array<vec4<f32>, 9>, // the player's coupled sections as boxes (three vec4 each, like inside_a, _b, _c)
 };
 
 // 1 when the point lies inside the player's vehicle (its [boundingbox], shrunk a little so
@@ -80,6 +81,31 @@ fn near_player_vehicle(world: vec3<f32>) -> f32 {
     let z = d.z - camera.inside_c.z;
     let h = camera.inside_b.yzw + vec3<f32>(0.25);
     return select(0.0, 1.0, abs(x) < h.x && abs(y) < h.y && abs(z) < h.z);
+}
+
+// [ROLLBACK rtparts-120] 1 when the point belongs to the player's vehicle or to a section coupled to it
+// (`parts`, the `puddle_parts` boxes), grown a little as `near_player_vehicle` is.
+fn near_player_train(world: vec3<f32>) -> f32 {
+    if (near_player_vehicle(world) > 0.5) {
+        return 1.0;
+    }
+    for (var k = 0u; k < 3u; k = k + 1u) {
+        let c = camera.parts[k * 3u + 2u];
+        if (c.w < 0.5) {
+            continue;
+        }
+        let a = camera.parts[k * 3u];
+        let b = camera.parts[k * 3u + 1u];
+        let d = world - a.xyz;
+        let x = d.x * b.x - d.y * a.w - c.x;
+        let y = d.x * a.w + d.y * b.x - c.y;
+        let z = d.z - c.z;
+        let h = b.yzw + vec3<f32>(0.25);
+        if (abs(x) < h.x && abs(y) < h.y && abs(z) < h.z) {
+            return 1.0;
+        }
+    }
+    return 0.0;
 }
 
 // How much of the way from the camera to `world` lies outside the player's vehicle: there is
@@ -1608,6 +1634,11 @@ fn fs_vanilla_reflections(in: FsIn) -> EnhancedOut {
 }
 
 fn shade_vanilla(in: FsIn, puddle_weight: ptr<function, f32>, eye: vec3<f32>) -> vec4<f32> {
+    let c = shade_vanilla_linear(in, puddle_weight, eye);
+    return vec4<f32>(finish_output(c.rgb), c.a);
+}
+
+fn shade_vanilla_linear(in: FsIn, puddle_weight: ptr<function, f32>, eye: vec3<f32>) -> vec4<f32> {
     if (material.emissive.w > 1.5) {
         // a pane's film of water: drops, not the sliding texture
         let v = normalize(camera.cam_pos.xyz - in.world);

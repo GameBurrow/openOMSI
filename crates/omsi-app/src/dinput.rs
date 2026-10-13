@@ -585,6 +585,8 @@ impl DirectInput {
             let mut empty = initially_empty;
             // (a device plugged in raises several notifications: look once they settle)
             let mut pending: Option<Instant> = None;
+            // [ROLLBACK ctrllog-122] the last list written to the log: only a change is worth a line
+            let mut logged: Option<String> = None;
             loop {
                 loop {
                     match requests.try_recv() {
@@ -625,7 +627,11 @@ impl DirectInput {
                     last = Instant::now();
                     let v = list(&di);
                     empty = v.is_empty();
-                    log::info!("game controllers found: {}", v.iter().map(|d| d.1.as_str()).collect::<Vec<_>>().join(", "));
+                    let names = v.iter().map(|d| d.1.as_str()).collect::<Vec<_>>().join(", ");
+                    if logged.as_deref() != Some(names.as_str()) {
+                        log::info!("game controllers found: {}", names);
+                        logged = Some(names);
+                    }
                     let mut found = f2.lock().unwrap();
                     // A second enumeration must not overwrite a removal before poll consumes it.
                     let mut removed_paths = found.take().map(|r| r.removed_paths).unwrap_or_default();

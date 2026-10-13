@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// The overlays, as `devtools_proc::VIEW_KEYS` names them.
-const VIEW_KEYS: [&str; 12] = [
-    "seats", "standing", "paths", "pathlabels", "devices", "boxes", "axles", "cog", "lights", "mirrors", "viewsdriver", "viewspax",
+const VIEW_KEYS: [&str; 16] = [
+    "seats", "standing", "paths", "pathlabels", "devices", "boxes", "axles", "cog", "lights", "mirrors", "viewsdriver", "viewspax", "aihumans", "aipaths", "aicars", "aicolls",
 ];
 
 /// Tell the game something (one line).
@@ -79,10 +79,23 @@ pub fn run(instance: wgpu::Instance) -> anyhow::Result<()> {
 /// keeps for it (`game.log`, or `game-n.log` with several games), or `game.log` when the game
 /// was not started by the launcher.
 fn open_game_log() {
+    // [ROLLBACK devtools-85] the game's own entry (by the id the launcher gave it, else by its
+    // process), only a log that exists; otherwise the folder the logs go to for this user
     let pid: Option<u32> = std::env::var("OMSI_DEVTOOLS_GAME_PID").ok().and_then(|v| v.parse().ok());
-    let found = pid.and_then(|p| omsi_launcher_lib::instances::list().into_iter().find(|i| i.pid == p)).map(|i| std::path::PathBuf::from(i.log));
-    let path = found.filter(|p| p.exists()).unwrap_or_else(|| omsi_launcher_lib::data_dir().join("game.log"));
-    crate::version::open_url(&path.to_string_lossy());
+    let id = std::env::var("OMSI_INSTANCE").ok().filter(|s| !s.is_empty());
+    let all = omsi_launcher_lib::instances::list();
+    let mine = id.as_ref().and_then(|id| all.iter().find(|i| &i.id == id)).or_else(|| pid.and_then(|p| all.iter().filter(|i| i.pid == p).max_by_key(|i| i.started)));
+    let dir = omsi_launcher_lib::data_dir();
+    let log = mine.map(|i| std::path::PathBuf::from(&i.log)).filter(|p| p.is_file()).or_else(|| Some(dir.join("game.log")).filter(|p| p.is_file()));
+    let target = log.unwrap_or(dir);
+    #[cfg(target_os = "windows")]
+    {
+        // explorer takes the path as it is (no file association needed for .log)
+        let t = target.to_string_lossy().replace('/', "\\");
+        let _ = if target.is_file() { std::process::Command::new("explorer").arg(format!("/select,{t}")).spawn() } else { std::process::Command::new("explorer").arg(t).spawn() };
+    }
+    #[cfg(not(target_os = "windows"))]
+    crate::version::open_url(&target.to_string_lossy());
 }
 
 /// One watched variable.
@@ -101,11 +114,17 @@ struct Watch {
 /// The tools' state, apart from the window.
 struct Tools {
     /// The overlays on (by `VIEW_KEYS`).
-    view: [bool; 12],
+    view: [bool; 16],
+    /// [ROLLBACK aidebug-89] What the game said about the player's bus sign and the nearest stop.
+    sign: Vec<String>,
+    /// [ROLLBACK tune-104] The values of the AI avoidance (by `traffic::TUNE`) as set now.
+    tune: Vec<f32>,
     /// The list of switches is open.
     overlays_open: bool,
-    /// 0: overlays, reloads and variables; 1: the mirror editor.
+    /// [ROLLBACK gfx-119] 0: reloads and variables; 1: overlays; 2: the mirror editor; 3: AI debug.
     page: usize,
+    /// [ROLLBACK payload-121] What the game says the player's vehicle weighs (kg): itself, its passengers, both.
+    weights: [f32; 3],
     mirrors: Vec<MirrorRow>,
     incoming_mirrors: Vec<MirrorRow>,
     mirror_sel: usize,
@@ -271,9 +290,12 @@ fn save_lists(lists: &[(String, Vec<(bool, String)>)]) {
 impl Tools {
     fn new() -> Tools {
         Tools {
-            view: [false; 12],
+            view: [false; 16],
+            sign: Vec::new(),
+            tune: crate::traffic::TUNE.iter().map(|t| t.2).collect(),
             overlays_open: true,
             page: 0,
+            weights: [0.0; 3],
             mirrors: Vec::new(),
             incoming_mirrors: Vec::new(),
             mirror_sel: 0,
@@ -311,6 +333,17 @@ impl Tools {
                     self.view[i] = f[2] == "1";
                 }
             }
+            "tune" if f.len() >= 3 => {
+                if let (Some(i), Ok(v)) = (crate::traffic::TUNE.iter().position(|t| t.0 == f[1]), f[2].trim().replace(',', ".").parse::<f32>()) {
+                    self.tune[i] = v;
+                }
+            }
+            "weights" if f.len() >= 4 => {
+                for (k, v) in self.weights.iter_mut().enumerate() {
+                    *v = f[k + 1].trim().parse().unwrap_or(0.0);
+                }
+            }
+            "aisign" => self.sign = f.get(1).map(|s| s.split('\u{1f}').map(|l| l.to_string()).collect()).unwrap_or_default(),
             "vehicle" => self.vehicle = Some(f.get(1).copied().unwrap_or("").to_string()).filter(|v| !v.is_empty()),
             "names_begin" => self.incoming = [Vec::new(), Vec::new()],
             "name" if f.len() >= 3 => self.incoming[is_str as usize].push(f[2].to_string()),
@@ -477,6 +510,73 @@ impl Tools {
         }
     }
 
+    /// [ROLLBACK aidebug-89] The AI debug page: what the player's bus shows (to compare with
+    /// the stop's line records) and the switches for the people's and the cars' overlays.
+    fn draw_ai(&mut self, ui: &mut Ui, size: Vec2, y0: f32, out: &mut Vec<String>) {
+        let area = Rect::new(0.0, y0, size.x, (size.y - y0 - 6.0).max(120.0));
+        ui.scroll_area("dt-ai", area, &mut |ui, r| {
+            let mut y = r.y;
+            let pad = 20.0;
+            let w = (size.x - 2.0 * pad).max(200.0);
+            ui.text("Player's bus: sign and boarding", Vec2::new(pad, y + 12.0), 15.0, Weight::Bold, TEXT_SOFT, Align::Left);
+            y += 24.0;
+            if self.sign.is_empty() {
+                y += ui.paragraph("Nothing yet: the game has not said anything about a vehicle.", Vec2::new(pad, y), w, 13.0, Weight::Regular, TEXT_DIM) + 4.0;
+            }
+            for (k, line) in self.sign.iter().enumerate() {
+                let (size_px, weight, colour) = if k == 0 { (16.0, Weight::Bold, ACCENT) } else { (13.0, Weight::Regular, TEXT) };
+                y += ui.paragraph(line, Vec2::new(pad, y), w, size_px, weight, colour) + 3.0;
+            }
+            y += 12.0;
+            ui.text("Over the picture in the game", Vec2::new(pad, y + 12.0), 15.0, Weight::Bold, TEXT_SOFT, Align::Left);
+            y += 26.0;
+            let labels = [
+                "People: what each does (task, stop, destination, line record, bus)",
+                "People: planned ways (pavement legs, the point walked to)",
+                "Cars: the lanes they mean to drive (140 m ahead)",
+                "Cars: collision detection (box, what they see ahead, lead, blocker)",
+            ];
+            for (k, label) in labels.iter().enumerate() {
+                let at = 12 + k;
+                let mut on = self.view[at];
+                if ui.toggle(&format!("dt-view-{at}"), Rect::new(pad, y, w.min(620.0), 28.0), &mut on, label) {
+                    self.view[at] = on;
+                    out.push(format!("view\t{}\t{}", VIEW_KEYS[at], on as u8));
+                }
+                y += 30.0;
+            }
+            y += 6.0;
+            let hint = "People are shown within 70 m, cars within 160 m of the camera; people further than 25 m show two lines only. Colours of people: yellow waiting, cyan going to the bus, green in the bus, pink going out, grey strolling. Cars: blue ways (orange when held), box green (red when held), yellow = the nearest thing ahead, blue = the car in front, pink = a body in the way.";
+            y += ui.paragraph(hint, Vec2::new(pad, y), w, 12.5, Weight::Regular, TEXT_DIM) + 14.0;
+            // [ROLLBACK tune-104] the values of the cars' going round the player's vehicle, live
+            ui.text("Cars going round the player's vehicle: values (live)", Vec2::new(pad, y + 12.0), 15.0, Weight::Bold, TEXT_SOFT, Align::Left);
+            y += 26.0;
+            for (k, t) in crate::traffic::TUNE.iter().enumerate() {
+                ui.text(t.1, Vec2::new(pad, y + 13.0), 13.0, Weight::Regular, TEXT, Align::Left);
+                let mut v = self.tune[k];
+                let sw = (w - 400.0).clamp(160.0, 400.0);
+                if ui.slider(&format!("dt-tune-{k}"), Rect::new(pad + 390.0, y, sw, 26.0), &mut v, t.3, t.4, t.5, "", &|x| num(x)) {
+                    self.tune[k] = v;
+                    out.push(format!("tune\t{}\t{}", t.0, num(v)));
+                }
+                y += 30.0;
+            }
+            y += 4.0;
+            if ui.button("dt-tune-reset", Rect::new(pad, y, 150.0, 30.0), "Defaults", None, ButtonKind::Normal) {
+                for (k, t) in crate::traffic::TUNE.iter().enumerate() {
+                    self.tune[k] = t.2;
+                    out.push(format!("tune\t{}\t{}", t.0, num(t.2)));
+                }
+            }
+            if ui.button("dt-tune-copy", Rect::new(pad + 158.0, y, 150.0, 30.0), "Copy values", None, ButtonKind::Primary) {
+                let text: Vec<String> = crate::traffic::TUNE.iter().enumerate().map(|(k, t)| format!("{} = {}", t.0, num(self.tune[k]))).collect();
+                ui.clipboard_out = Some(text.join("\r\n"));
+            }
+            y += 40.0;
+            y - r.y
+        });
+    }
+
     /// The interface; what the game should hear goes into `out`.
     fn draw(&mut self, ui: &mut Ui, size: Vec2, out: &mut Vec<String>) {
         let pad = 20.0;
@@ -492,15 +592,33 @@ impl Tools {
         }
         let mut y = 84.0;
         let mut page = self.page;
-        if ui.segmented("dt-page", Rect::new(pad, y, 300.0_f32.min(w), 28.0), &mut page, &["Overlays and variables", "Mirror editor"]) {
+        if ui.segmented("dt-page", Rect::new(pad, y, 640.0_f32.min(w), 28.0), &mut page, &["Variables", "Overlays", "Actions", "Mirror editor", "AI debug"]) {
             self.page = page;
         }
         y += 38.0;
-        if self.page == 1 {
+        if self.page == 3 {
             self.draw_mirrors(ui, size, y, out);
             return;
         }
+        if self.page == 4 {
+            self.draw_ai(ui, size, y, out);
+            return;
+        }
+        if self.page == 2 {
+            self.draw_actions(ui, size, y, out);
+            return;
+        }
+        if self.page == 1 {
+            self.draw_overlays(ui, size, y, out);
+            return;
+        }
+        self.draw_variables(ui, size, y, out);
+    }
 
+    /// [ROLLBACK gfx-119] The page of the overlays on the picture.
+    fn draw_overlays(&mut self, ui: &mut Ui, size: Vec2, mut y: f32, out: &mut Vec<String>) {
+        let pad = 20.0;
+        let w = (size.x - 2.0 * pad).max(200.0);
         // --- what the game draws over the picture: a list that folds up
         let head = Rect::new(pad, y, w, 28.0);
         if ui.row("dt-overlays-head", head, false) {
@@ -536,7 +654,11 @@ impl Tools {
             let two = w >= 760.0;
             let col = if two { (w - 20.0) * 0.5 } else { w.min(520.0) };
             for (k, label) in labels.iter().enumerate() {
-                let (cx, row) = if two { (pad + (k % 2) as f32 * (col + 20.0), k / 2) } else { (pad, k) };
+                let (cx, row) = if two {
+                    (pad + (k % 2) as f32 * (col + 20.0), k / 2)
+                } else {
+                    (pad, k)
+                };
                 let r = Rect::new(cx, y + row as f32 * 30.0, col, 28.0);
                 let at = k;
                 let mut on = self.view[at];
@@ -545,11 +667,32 @@ impl Tools {
                     out.push(format!("view\t{}\t{}", VIEW_KEYS[at], on as u8));
                 }
             }
-            let rows = if two { labels.len().div_ceil(2) } else { labels.len() };
+            let rows = if two {
+                labels.len().div_ceil(2)
+            } else {
+                labels.len()
+            };
             y += rows as f32 * 30.0;
         }
+        // [ROLLBACK payload-121] under the centre of gravity: what the vehicle weighs
         y += 12.0;
+        let head = Vec2::new(pad, y + 12.0);
+        let bold = Weight::Bold;
+        let title = "Weight of the vehicle";
+        ui.text(title, head, 15.0, bold, TEXT_SOFT, Align::Left);
+        y += 26.0;
+        let [own, pax, real] = self.weights;
+        let names = ["Vehicle itself", "Passengers", "Real (both)"];
+        for (k, (label, kg)) in names.iter().zip([own, pax, real]).enumerate() {
+            let at = Vec2::new(pad, y + 14.0 + k as f32 * 22.0);
+            let line = format!("{label}: {kg:.0} kg");
+            ui.text(&line, at, 14.0, Weight::Regular, TEXT, Align::Left);
+        }
+    }
 
+    /// [ROLLBACK payload-121] The Actions page: what the game reads again, and the passengers.
+    fn draw_actions(&mut self, ui: &mut Ui, _size: Vec2, mut y: f32, out: &mut Vec<String>) {
+        let pad = 20.0;
         // --- what the game can read from the files again, without a new session
         ui.text("Reload while playing", Vec2::new(pad, y + 12.0), 15.0, Weight::Bold, TEXT_SOFT, Align::Left);
         y += 22.0;
@@ -579,6 +722,31 @@ impl Tools {
         }
         y += 8.0;
 
+        let head = Vec2::new(pad, y + 12.0);
+        let bold = Weight::Bold;
+        let title = "Passengers (made up, to try the weight)";
+        ui.text(title, head, 15.0, bold, TEXT_SOFT, Align::Left);
+        y += 22.0;
+        let normal = ButtonKind::Normal;
+        let r = Rect::new(pad, y, 230.0, 30.0);
+        if ui.button("dt-act-standing", r, "Fill all standing places", None, normal) {
+            out.push("act\tfill_standing".to_string());
+        }
+        let r = Rect::new(pad + 240.0, y, 210.0, 30.0);
+        if ui.button("dt-act-seats", r, "Fill all seats", None, normal) {
+            out.push("act\tfill_seats".to_string());
+        }
+        y += 36.0;
+        let r = Rect::new(pad, y, 230.0, 30.0);
+        if ui.button("dt-act-clear", r, "Remove made up passengers", None, normal) {
+            out.push("act\tclear".to_string());
+        }
+    }
+
+    /// The first page: the variables of the vehicle.
+    fn draw_variables(&mut self, ui: &mut Ui, size: Vec2, mut y: f32, out: &mut Vec<String>) {
+        let pad = 20.0;
+        let w = (size.x - 2.0 * pad).max(200.0);
         // --- the variables
         ui.text("Variables of the vehicle", Vec2::new(pad, y + 12.0), 15.0, Weight::Bold, TEXT_SOFT, Align::Left);
         y += 22.0;

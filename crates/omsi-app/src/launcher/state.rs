@@ -859,7 +859,7 @@ impl State {
                 if !self.vehicles.iter().any(|v| v.file == self.choice.bus) {
                     if let Some(v) = self.vehicles.first() {
                         self.choice.bus = v.file.clone();
-                        self.choice.paint.clear();
+                        self.choice.paint = self.random_paint();
                         self.choice.hof = self.default_hof();
                     }
                 }
@@ -1112,12 +1112,28 @@ impl State {
             .unwrap_or_default()
     }
 
+    /// [ROLLBACK launcher-119] A livery of the chosen bus at random (its own paint or one of its repaints), so the
+    /// first picture is not always the same one; the bus's own paint where it has no repaint.
+    fn random_paint(&self) -> String {
+        let Some(v) = self.bus().filter(|v| !v.paints.is_empty()) else {
+            return String::new();
+        };
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize ^ d.as_secs() as usize)
+            .unwrap_or(0);
+        match (n.wrapping_mul(2654435761) >> 7) % (v.paints.len() + 1) {
+            0 => String::new(),
+            i => v.paints[i - 1].clone(),
+        }
+    }
+
     pub fn select_bus(&mut self, file: &str) {
         if self.choice.bus == file {
             return;
         }
         self.choice.bus = file.to_string();
-        self.choice.paint.clear();
+        self.choice.paint = self.random_paint();
         self.choice.number.clear();
         // (a hand-picked depot file stays when the new bus has one of that name)
         let keep = self.choice.hof_manual && self.bus().is_some_and(|v| v.hofs.iter().any(|h| h.eq_ignore_ascii_case(&self.choice.hof)));

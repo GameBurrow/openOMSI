@@ -18,8 +18,10 @@ const HEADLIGHT_INTENSITY: f32 = 45.0;
 /// A headlight's strength in the classic picture, as a map lamp's (`PointLight::intensity`).
 /// Measured against OMSI 2 from above, the stock NL202 at night in Spandau: its pool is
 /// some 18 of 255 over the unlit cobbles 1.5 - 2.5 m ahead, 12 at 4 - 5 m and nearly gone
-/// at 7 m; this gives 20, 12 and 5 there. (At 1 it was 60, 40 and 15.)
-const VANILLA_HEADLIGHT_INTENSITY: f32 = 0.2;
+/// at 7 m; this gave 20, 12 and 5 there. (At 1 it was 60, 40 and 15.)
+/// [ROLLBACK vanlights-119] 0.5 (was 0.2): at 0.2 the spotlights were hardly to be seen in
+/// the Vanilla picture, its pool and the lit walls and kerbs ahead of the lamp.
+const VANILLA_HEADLIGHT_INTENSITY: f32 = 0.5;
 
 /// Lighting parameters for the renderer from the daylight model.
 pub fn lighting_from(d: &Daylight, fog_range: f32) -> Lighting {
@@ -125,6 +127,7 @@ pub fn vehicle_lights(
     lights: &mut Vec<PointLight>,
     night: f32,
     shadow: bool,
+    auto_spot: bool,
 ) {
     let first = lights.len();
     let ty = &v.ty;
@@ -249,6 +252,36 @@ pub fn vehicle_lights(
             for (pos, dir, share) in spotlight_2_lamps(sp, value_of(sp.variable.as_str())) {
                 let at = origin + rot.transform_point3(pos).as_dvec3();
                 let d = rot.transform_vector3(dir).normalize_or_zero();
+                push_spot(lights, at, d, &sp.values, share, night);
+            }
+        }
+    }
+    // [ROLLBACK aispot-83] An AI vehicle with no spotlight of any kind of its own ([spotlight],
+    // [spotlight_2], [spotlight_cookie], its sections' too) gets a [spotlight_2] pair as if it
+    // had declared one: at the front of its bounding box, low, pointing straight ahead, 255 255
+    // 200, cones 20 / 60, reaching 50 to 65 m (drawn once for the vehicle), switched by its
+    // `AI_Light` like the AI's own lamps. Not for the far ones (`auto_spot`).
+    if auto_spot
+        && v.ai_driven
+        && parts.iter().all(|(m, ..)| m.spotlights.is_empty() && m.spotlights_2.is_empty() && m.spotlights_cookie.is_empty())
+    {
+        let k = value_of("AI_Light").clamp(0.0, 1.0);
+        // [width, length, height, centre x, centre y, centre z]; a bicycle is no car
+        let bb = ty.def.bounding_box.unwrap_or([2.0, 4.5, 1.6, 0.0, 0.0, 0.8]);
+        if k > 0.0 && bb[1] >= 2.5 {
+            let bottom = bb[5] - bb[2] * 0.5;
+            let x = (bb[0] * 0.30).clamp(0.3, 0.9);
+            let y = bb[4] + bb[1] * 0.5 - 0.1;
+            let z = bottom + (bb[2] * 0.36).clamp(0.5, 1.0);
+            // (one [spotlight_2] entry: its flag 0 makes the pair, as for a declared one)
+            let sp = omsi_model::Spotlight2 {
+                values: [-x, y, z, 0.0, 1.0, 0.0, 255.0, 255.0, 200.0, v.ai_spot_range, 20.0, 60.0],
+                variable: String::new(),
+                mirrored: true,
+            };
+            for (pos, dir, share) in spotlight_2_lamps(&sp, k) {
+                let at = v.position + body.transform_point3(pos).as_dvec3();
+                let d = body.transform_vector3(dir).normalize_or_zero();
                 push_spot(lights, at, d, &sp.values, share, night);
             }
         }
@@ -484,6 +517,8 @@ mod spot_tests {
 
 /// Map lights and scenery coronas are only drawn this close to the camera.
 const MAP_LIGHT_RANGE: f64 = 600.0;
+/// [ROLLBACK aispot-83] How near (m) an AI vehicle is to be given its headlamp.
+const AUTO_SPOT_RANGE: f64 = 250.0;
 const CORONA_RANGE: f64 = 1500.0;
 /// How far the camera may move before the nearby static lights are gathered again.
 const NEAR_MARGIN: f64 = 100.0;
@@ -602,7 +637,9 @@ pub fn collect(
     }
     // (the callers list the player's vehicle first, when there is one)
     for (i, v) in vehicles.iter().enumerate() {
-        vehicle_lights(v, &mut scene.coronas, &mut scene.lights, night, i == 0);
+        // (the AI's own lamp only for the cars within 250 m: four more lights each)
+        let near = (v.position - camera_pos).length() < AUTO_SPOT_RANGE;
+        vehicle_lights(v, &mut scene.coronas, &mut scene.lights, night, i == 0, near);
         let cab = crate::puddles::cab_bodies(&[*v], camera_pos);
         particle_sprites_in(&v.particles, &mut scene.smoke, &mut scene.coronas, &cab);
         for t in &v.trailers {

@@ -399,7 +399,7 @@ friendlyname groups onlyeditor complexity rendertype(presurface|surface|on_surfa
 LightMapMapping nomaplighting NightMapMode fixed absheight collision_mesh crossing_heightdeformation
 nocollision surface switch traffic_lights_group traffic_light phase approachdist traffic_light_stop
 traffic_light_jump splinehelper path path_2 use_traffic_light blockpath crossingproblem switchdir
-model scriptshare varnamelist stringvarnamelist script constfile sound sound_ai paths passengercabin
+model scriptshare int_sounds_separate varnamelist stringvarnamelist script constfile sound sound_ai paths passengercabin
 busstop entrypoint carpark_p trafficlight signal helparrow depot petrolstation tree
 add_camera_reflexion(_2) mass momentofintertia cog boundingbox crashmode_pole new_attachment
 (attach_trans attach_rot_x/y/z) maplight rail_enh third_rail triggerbox_new triggerbox_setreverb

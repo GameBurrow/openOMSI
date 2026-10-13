@@ -125,8 +125,9 @@ fn early_wait(depart: f64, now: f64, layover: bool, rail: bool) -> f64 {
 }
 /// [ROLLBACK aiparked-73] A wait at a stop this long (3.5 minutes) stops the engine; it starts
 /// again this long (s) before the departure.
-const PARKED_WAIT: f64 = 210.0;
-const PARKED_START: f64 = 75.0;
+// [ROLLBACK engine-95] was 210 s / 75 s: the engine stops for any wait over two minutes and starts a minute before
+const PARKED_WAIT: f64 = 120.0;
+const PARKED_START: f64 = 60.0;
 /// On a layover, the doors open this long before the departure.
 const LAYOVER_BOARDING: f64 = 45.0;
 /// Pull into the bay over this distance before the stop: the stop's docking distance,
@@ -160,6 +161,12 @@ pub struct Ctx<'a> {
     pub passing: bool,
     /// Where it would swerve to round a car parked at the kerb.
     pub kerb_swerve: Option<f32>,
+    /// [ROLLBACK bus-106] Another bus stands at the same stop close ahead of it (its tail within
+    /// 9 m): this one, once in its bay and still, serves the stop where it stands.
+    pub lead_close: bool,
+    /// [ROLLBACK bus-108] Another bus comes up behind it for the same stop: it pulls on a
+    /// few metres past its stop point, to leave the one behind room in the bay.
+    pub follower_close: bool,
     /// Somebody aboard wants to get off at the front stop or somebody waits there (None:
     /// nobody knows - no passengers run - and every stop is served).
     pub wanted: Option<bool>,
@@ -210,7 +217,7 @@ impl BusService {
     /// [ROLLBACK aiparked-73] Standing out a long layover with the engine off: it starts again
     /// `PARKED_START` before the doors open for the departure.
     pub fn parked(&self, day_time: f64) -> bool {
-        self.phase == Phase::Waiting && self.long_wait && self.leave_at - day_time > PARKED_START
+        matches!(self.phase, Phase::Waiting | Phase::Boarding) && self.long_wait && self.leave_at - day_time > PARKED_START
     }
 
     /// Standing at a stop (boarding, waiting or pulling out).
@@ -464,14 +471,23 @@ impl BusService {
             }
             // queued behind something standing at its stop (another bus, the player's):
             // after a while it serves the stop where it stands, as drivers do
-            let queued = speed < 0.3 && ctx.stopped > 6.0 && d < 45.0 && d >= 2.0;
-            if (d < 2.0 && speed < 0.3) || queued || (d < -2.0 && crept_past) {
+            let in_bay = (st.lateral - stop.bay).abs() < 0.5;
+            // (a bus with another one behind it for this stop pulls on past the stop point)
+            let pull = if ctx.follower_close { 2.5 } else { 0.0 };
+            let close = ctx.lead_close
+                && in_bay
+                && speed < 0.5
+                && ctx.stopped > 0.8
+                && d < 45.0
+                && d >= 2.0;
+            let queued = close || (speed < 0.3 && ctx.stopped > 6.0 && d < 45.0 && d >= 2.0);
+            if (d < 2.0 && speed < 0.3) || queued || (d < -2.0 - pull && crept_past) {
                 self.near_d = f32::INFINITY;
                 self.arrive(ctx, stop.depart, (st.lane, st.s));
                 return Some(st.front);
             }
             self.near_d = d;
-            if d < -2.0 {
+            if d < -2.0 - pull {
                 // missed it
                 if ctx.debug || omsi_cfg::env::var_os("OMSI_DEBUG_STOPS").is_some() {
                     log::info!("t={:.1}: timetable bus {} missed its stop ({:.1} m past, {:.1} m/s, stood {:.1} s, passing {})", ctx.day_time, ctx.id, -d, speed, ctx.stopped, ctx.passing);
@@ -483,7 +499,7 @@ impl BusService {
             }
             if d < STOP_REACH {
                 // the stop point is where the front of the bus comes to rest
-                return Some(d.max(0.0) + st.front - 0.3);
+                return Some((d + pull).max(0.0) + st.front - 0.3);
             }
             return None;
         }

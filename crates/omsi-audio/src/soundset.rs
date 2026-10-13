@@ -58,6 +58,9 @@ pub struct SoundSet {
     inside: bool,
     /// This set belongs to an AI vehicle or another player's (Omsi.exe's view 4).
     ai: bool,
+    /// [ROLLBACK ambient-96] A sound of the surroundings (scenery): heard in the player's cab like
+    /// an AI vehicle's - turned down by `Snd_OutsideVol` and through the bodywork's low-pass.
+    ambient: bool,
     /// The player's own vehicle moves with its listener; its 3D sounds still pan and fade,
     /// but frame timing must not turn their fixed cabin positions into Doppler pitch shifts.
     listener_vehicle: bool,
@@ -68,6 +71,10 @@ pub struct SoundSet {
     /// cab's share while the two are mixed (`None` at rest), and where the mix has got to.
     mix: Option<f32>,
     mix_state: Option<f32>,
+    /// [ROLLBACK intsep-122] With `[int_sounds_separate]`: the listener is in another section of
+    /// this bus than the one this set belongs to (see [`SoundSet::set_listener_section`]). This
+    /// section's interior sounds are then not heard, its outside ones only through the bodywork.
+    other_section: bool,
     /// The sound sets of the coupled parts (with the part's index among the vehicle's
     /// trailers): the rear section of an articulated bus has a `[sound]` of its own - on a
     /// pusher like the MB C2 G that is where the engine is - and plays it on the triggers
@@ -204,9 +211,11 @@ impl SoundSet {
             ai: false,
             listener_vehicle: false,
             muffled: false,
+            ambient: false,
             mix: None,
             mix_state: None,
             parts: Vec::new(),
+            other_section: false,
         }
     }
 
@@ -243,6 +252,17 @@ impl SoundSet {
         self.set_mix(if between { Some(mix) } else { None });
         // (a walker in the doorway: the view the sounds are first chosen by is the nearer one)
         self.set_inside(if between { mix >= 0.5 } else { inside_of(mix, inside) });
+    }
+
+    /// [ROLLBACK intsep-122] `[int_sounds_separate]`: the listener (inside the bus) is in
+    /// `section` (0 the front one, `n + 1` the coupled part `n`). With `separate`, every other
+    /// section's set stops playing its interior sounds, and its outside sounds come through
+    /// the bodywork (at `Snd_OutsideVol`, low-passed). `None` or `!separate`: as always.
+    pub fn set_listener_section(&mut self, section: Option<usize>, separate: bool) {
+        self.other_section = separate && section.is_some_and(|s| s != 0);
+        for (i, p) in &mut self.parts {
+            p.other_section = separate && section.is_some_and(|s| s != *i + 1);
+        }
     }
 
     fn set_mix(&mut self, mix: Option<f32>) {
@@ -327,6 +347,12 @@ impl SoundSet {
         } else {
             1
         }
+    }
+
+    /// [ROLLBACK ambient-96] Mark this set as a sound of the surroundings (scenery), which the
+    /// cab keeps out like the traffic's.
+    pub fn set_ambient(&mut self, ambient: bool) {
+        self.ambient = ambient;
     }
 
     /// A sound set heard from outside: an AI vehicle's or another player's (view 4). Its
@@ -651,7 +677,16 @@ impl SoundSet {
     }
 
     fn ctx_without_engine(&self) -> Ctx {
-        Ctx { view: self.view_mask(), cab: self.muffled, master: self.master, doppler: !self.listener_vehicle, listener: Vec3::ZERO, mix: self.mix }
+        Ctx {
+            view: self.view_mask(),
+            cab: self.muffled,
+            master: self.master,
+            doppler: !self.listener_vehicle,
+            listener: Vec3::ZERO,
+            mix: self.mix,
+            ambient: self.ambient,
+            other: self.other_section,
+        }
     }
 
     pub fn stop_all(&mut self, engine: &AudioEngine) {
@@ -670,6 +705,10 @@ impl SoundSet {
 struct Ctx {
     /// The cab's share while the cab and the street are mixed (a walker in the doorway).
     mix: Option<f32>,
+    /// [ROLLBACK ambient-96] a sound of the surroundings (see `SoundSet::ambient`)
+    ambient: bool,
+    /// [ROLLBACK intsep-122] see `SoundSet::other_section`
+    other: bool,
     view: i32,
     cab: bool,
     master: f32,
@@ -681,6 +720,20 @@ impl Ctx {
     /// The `[viewpoint]` test (0x750462): the entry is heard when it names the view, names
     /// none, or is an outside sound of the player's bus heard from its cab while
     /// `Snd_OutsideVol` is over 0.01 (doors or a window open).
+    /// [ROLLBACK intsep-122] The `[viewpoint]` an entry counts with: its own, but in another
+    /// section of the bus than the listener's (`[int_sounds_separate]`) the interior sounds
+    /// are gone (`None`) and every other entry is an outside one (1).
+    fn vp_of(&self, vp: i32) -> Option<i32> {
+        if self.other && self.view == 2 {
+            return if vp == 0 || vp & 1 != 0 {
+                Some(1)
+            } else {
+                None
+            };
+        }
+        Some(vp)
+    }
+
     fn view_lets_through(&self, vp: i32) -> bool {
         vp == 0 || vp & self.view != 0 || (vp & 2 == 0 && self.view == 2 && outside_vol() > 0.01)
     }
@@ -706,8 +759,23 @@ impl Ctx {
     /// One entry this frame (`TSound` update 0x750340): its volume and pitch as DirectSound
     /// takes them, and whether it can be started.
     fn eval(&self, s: &mut RuntimeSound, var: &dyn Fn(&str) -> Option<f32>, object_to_world: &Mat4) -> Eval {
+        // [ROLLBACK introvol-122] An entry that is not playing starts on a buffer of its own, at 0 dB
+        // (as `play_file_trigger` has it): the volume a request over 0 dB is refused at is no
+        // stale one from a moment before - the engine still starting, the camera changed - and
+        // the cab's sounds do not stay quieter than their curves say until the view is switched.
+        if s.voice.is_none() {
+            s.last_gain = 1.0;
+        }
         let def = &s.def;
-        let weight = self.view_weight(def.viewpoint);
+        let Some(vp) = self.vp_of(def.viewpoint) else {
+            return Eval {
+                gain: 0.0,
+                audible: false,
+                pitch: s.last_pitch,
+                wrong_view: true,
+            };
+        };
+        let weight = self.view_weight(vp);
         if weight <= 0.0 {
             return Eval { gain: 0.0, audible: false, pitch: s.last_pitch, wrong_view: true };
         }
@@ -739,13 +807,13 @@ impl Ctx {
             vol *= g;
         }
         // an AI vehicle (view 4) heard from a cab: through the player's bus's bodywork
-        if self.view & 4 != 0 {
+        if self.view & 4 != 0 || self.ambient {
             // (sliding between the street and the cab: part of the way)
             let b = cab_blend().unwrap_or(if self.cab { 1.0 } else { 0.0 });
             vol *= 1.0 + (0.2 + outside_vol() - 1.0) * b;
         }
         // the player's bus's outside sound heard in its cab: through what is open
-        if self.mix.is_none() && def.viewpoint & 2 == 0 && def.viewpoint != 0 && self.view == 2 {
+        if self.mix.is_none() && vp & 2 == 0 && vp != 0 && self.view == 2 {
             vol *= outside_vol();
         }
         vol *= weight;
@@ -793,16 +861,30 @@ impl Ctx {
     /// and an open door lets the whole sound in. (Omsi.exe only lowers the volume; this is
     /// openOMSI's addition, so that it is not the same sound turned down.)
     fn through_bodywork_hz(&self, def: &SoundEntry) -> f32 {
+        // [ROLLBACK ambient-96] the traffic's and the surroundings' sounds heard in the cab get
+        // the same low-pass, closing with the cab (and with `Snd_OutsideVol`, the more is open
+        // the more gets through); in the street none
+        if self.view & 4 != 0 || self.ambient {
+            let w = cab_blend().unwrap_or(if self.cab { 1.0 } else { 0.0 });
+            if w <= 0.0 {
+                return 0.0;
+            }
+            let open = outside_vol().clamp(0.0, 1.0);
+            let cab = cab_cutoff(open);
+            let hz = 16000.0 * (cab / 16000.0).powf(w);
+            return if hz >= 15000.0 { 0.0 } else { hz };
+        }
         // only the own bus's outside sounds, and only while the script lets them in
         // (`Snd_OutsideVol` over 0.01: with 0 they are not heard at all)
         let w = self.mix.unwrap_or(if self.view == 2 { 1.0 } else { 0.0 });
         let open = outside_vol().clamp(0.0, 1.0);
-        if def.viewpoint & 2 != 0 || def.viewpoint == 0 || w <= 0.0 || open <= 0.01 {
+        let vp = self.vp_of(def.viewpoint).unwrap_or(def.viewpoint);
+        if vp & 2 != 0 || vp == 0 || w <= 0.0 || open <= 0.01 {
             return 0.0;
         }
         // 500 Hz shut, 16 kHz wide open (from 0.95), an even climb in octaves - and the
         // filter opens as the sound comes out of the cab
-        let cab = if open >= 0.95 { 16000.0 } else { 500.0 * (16000.0f32 / 500.0).powf(open) };
+        let cab = cab_cutoff(open);
         let hz = 16000.0 * (cab / 16000.0).powf(w);
         if hz >= 15000.0 {
             0.0
@@ -810,6 +892,19 @@ impl Ctx {
             hz
         }
     }
+}
+
+/// [ROLLBACK lowpass-97] The cutoff (Hz) of a shut-in cab for a `Snd_OutsideVol` of `open`: the
+/// filter's strength falls from full (500 Hz) at 0 to 20% at 0.3 and to nothing (16 kHz) at 0.5.
+fn cab_cutoff(open: f32) -> f32 {
+    let strength = if open >= 0.5 {
+        0.0
+    } else if open >= 0.3 {
+        0.2 * (0.5 - open) / 0.2
+    } else {
+        1.0 - 0.8 * open / 0.3
+    };
+    16000.0 * (500.0f32 / 16000.0).powf(strength)
 }
 
 /// The flag for a mix at rest (all in the cab, all out in the street), else the camera's.
@@ -862,7 +957,7 @@ mod tests {
     use omsi_vehicle::VolCurve;
 
     fn ctx(view: i32, cab: bool) -> Ctx {
-        Ctx { view, cab, master: 1.0, doppler: false, listener: Vec3::ZERO, mix: None }
+        Ctx { view, cab, master: 1.0, doppler: false, listener: Vec3::ZERO, mix: None, ambient: false, other: false }
     }
 
     fn eval(c: &Ctx, def: SoundEntry, var: &dyn Fn(&str) -> Option<f32>) -> Eval {
@@ -979,7 +1074,7 @@ mod tests {
         assert_eq!(eval(&ctx(2, true), hit.clone(), &now).gain, 0.0, "read at the frame's end: silent");
         let fired = |n: &str| at_fire("ev_doorhitclose_0", n).or_else(|| now(n));
         assert_eq!(eval(&ctx(2, true), hit.clone(), &fired).gain, 1.0);
-        let set = SoundSet { sounds: vec![RuntimeSound::new(hit, None)], master: 1.0, dir: Default::default(), inside: true, ai: false, listener_vehicle: true, muffled: false, parts: Vec::new() };
+        let set = SoundSet { sounds: vec![RuntimeSound::new(hit, None)], master: 1.0, dir: Default::default(), inside: true, ai: false, listener_vehicle: true, muffled: false, parts: Vec::new(), other_section: false };
         assert_eq!(set.curve_triggers(), vec!["ev_doorhitclose_0".to_string()]);
     }
 

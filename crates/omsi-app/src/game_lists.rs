@@ -50,6 +50,9 @@ pub(crate) enum ListKind {
     PlaceType(String),
     PlaceLivery(String),
     PlaceHof(String, String),
+    /// [ROLLBACK takeover-122] The vehicles standing in the world that can be driven: the ones the
+    /// player placed or left (and, on foot, the own one), nearest first.
+    Takeover,
 }
 
 /// A vehicle file of the menu's list (`Vehicles/...`) as its definition.
@@ -742,9 +745,66 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
                     let label = if e.name.trim().is_empty() { format!("{} {}", tr("entry"), e.index + 1) } else { e.name.trim().to_string() };
                     out.push((label, format!("spot {i}")));
                 }
+                // [ROLLBACK spotsort-124] alphabetical (the actions keep the entry's own index)
+                out.sort_by(|a, b| crate::launcher::drive::natural_cmp(&a.0, &b.0));
             }
             if out.is_empty() {
                 out.push((tr("This map has no entry points"), "back".into()));
+            }
+        }
+        ListKind::Takeover => {
+            // [ROLLBACK takeover-122] where the player is: the camera, else the vehicle driven
+            let from = app
+                .camera
+                .as_ref()
+                .map(|c| c.position)
+                .or_else(|| app.player.as_ref().map(|p| p.vehicle.position));
+            let mut rows: Vec<(f64, String, String)> = Vec::new();
+            let label =
+                |v: &omsi_sim::VehicleInstance, from: Option<glam::DVec3>| -> (f64, String) {
+                    let d = &v.ty.def;
+                    let name = format!("{} {}", d.manufacturer.trim(), d.type_name.trim())
+                        .trim()
+                        .to_string();
+                    let name = if name.is_empty() {
+                        d.path
+                            .file_stem()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    } else {
+                        name
+                    };
+                    let dist = from
+                        .map(|f| (v.position.truncate() - f.truncate()).length())
+                        .unwrap_or(0.0);
+                    let far = if dist >= 1000.0 {
+                        format!("{:.1} km", dist / 1000.0)
+                    } else {
+                        format!("{:.0} m", dist)
+                    };
+                    (dist, format!("{name}  ·  {far}"))
+                };
+            // (on foot, the own vehicle stands where it was left)
+            if app.on_foot.is_some() {
+                if let Some(p) = app.player.as_ref() {
+                    let (d, l) = label(&p.vehicle, from);
+                    rows.push((d, format!("{l}  ·  {}", tr("yours")), "own".into()));
+                }
+            }
+            for q in app
+                .placed
+                .iter()
+                .filter(|q| !q.vehicle.ty.def.is_rear_section())
+            {
+                let (d, l) = label(&q.vehicle, from);
+                rows.push((d, l, format!("take {}", q.uid)));
+            }
+            rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            for (_, l, a) in rows {
+                out.push((l, a));
+            }
+            if out.is_empty() {
+                out.push((tr("There is no other vehicle to drive"), "back".into()));
             }
         }
         ListKind::PlaceMaker => {
@@ -935,6 +995,7 @@ pub(crate) fn menu_extras(
         ListKind::Spots => (MenuKind::List, head("Teleport to a start point..."), None),
         ListKind::PlaceMaker | ListKind::PlaceType(_) | ListKind::PlaceLivery(_) | ListKind::PlaceHof(..) => (MenuKind::List, head("Place a vehicle..."), None),
         ListKind::Admin => (MenuKind::List, Some((tr("Administration"), String::new())), None),
+        ListKind::Takeover => (MenuKind::List, head("Drive another vehicle..."), None),
     }
 }
 
@@ -953,7 +1014,7 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
         return match kind {
             ListKind::Tours(..) => Some(ListKind::Lines),
             ListKind::Events => Some(ListKind::Keyboard(0)),
-            ListKind::Keyboard(_) => Some(ListKind::Controls),
+            ListKind::Keyboard(_) => Some(ListKind::Options(options_tab(app, "Controls"))),
             ListKind::PlaceType(_) | ListKind::PlaceLivery(_) | ListKind::PlaceHof(..) => Some(ListKind::PlaceMaker),
             _ => None,
         };
@@ -1029,6 +1090,25 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
                         app.shift_clock(by);
                     }
                 }
+                // [ROLLBACK walkmenus-125] the time of day buttons: morning and evening at the sun's rise and set
+                "tod" if step => {
+                    let (rise, set) = app.sun_times().unwrap_or((6.0 * 3600.0, 18.0 * 3600.0));
+                    if let Some(to) = arg.trim().parse::<usize>().ok().map(|j| [rise, 12.0 * 3600.0, set, 0.0][j.min(3)]) {
+                        let day = app.clock.time.rem_euclid(86400.0);
+                        app.shift_clock(to - day);
+                    }
+                }
+                // (hour, minute, second steps)
+                "tadj" if step => {
+                    if let Some(by) = arg.trim().parse::<usize>().ok().map(|j| [-3600.0, 3600.0, -60.0, 60.0, -1.0, 1.0][j.min(5)]) {
+                        app.shift_clock(by);
+                    }
+                }
+                "snow" if step => {
+                    flip_switch(app, if arg.trim() == "0" { "snow_cover" } else { "snow_road" });
+                }
+                "keyboard" if step => return Some(ListKind::Keyboard(0)),
+                "controllers" if step => return Some(ListKind::ControllerDevices(0)),
                 "traffic_clear" if step => {
                     crate::admin::clear_ai_traffic(app);
                 }
@@ -1121,6 +1201,20 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
                     }
                     Err(e) => app.service_msg = Some((format!("Depot file: {e}"), 4.0)),
                 }
+            }
+            None
+        }
+        ListKind::Takeover => {
+            app.close_game_menu();
+            if verb == "own" {
+                app.back_to_bus();
+            } else if let Some(k) = arg
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .and_then(|uid| app.placed.iter().position(|q| q.uid == uid))
+            {
+                app.take_placed(k);
             }
             None
         }
@@ -1747,6 +1841,9 @@ fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "nav_arrows" => app.navigator.as_ref().map_or(s.nav_arrows, |n| n.arrows),
         "nav_arrows_auto" => s.nav_arrows_auto,
         "exact_fare" => s.exact_fare,
+        "pax_greet" => s.pax_greet,
+        "pax_ticket" => s.pax_ticket,
+        "pax_complain" => s.pax_complain,
         "trip_summary" => s.trip_summary,
         "collision_pedestrians" => s.collision_pedestrians,
         "ssao" => s.ssao,
@@ -1941,6 +2038,18 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         "exact_fare" => {
             app.settings.exact_fare = on;
             Some(("exact_fare", bit))
+        }
+        "pax_greet" => {
+            app.settings.pax_greet = on;
+            Some(("pax_greet", bit))
+        }
+        "pax_ticket" => {
+            app.settings.pax_ticket = on;
+            Some(("pax_ticket", bit))
+        }
+        "pax_complain" => {
+            app.settings.pax_complain = on;
+            Some(("pax_complain", bit))
         }
         "trip_summary" => {
             app.settings.trip_summary = on;
@@ -2372,11 +2481,10 @@ fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
         "resolution" => crate::launcher::pages::RESOLUTIONS.to_vec(),
         "navigator_corner" => vec![("top-left", "Top left"), ("top-right", "Top right"), ("bottom-left", "Bottom left"), ("bottom-right", "Bottom right")],
         "boarding" => vec![("auto", "Pay and take the ticket"), ("pay", "The driver sells the ticket"), ("walk", "Just walk in")],
-        "pax_voices" => vec![("all", "Greetings and tickets"), ("tickets", "Only the ticket asked for"), ("off", "Silent")],
         "maintenance" => vec![("0", "Infinite (no wear)"), ("1", "Very bad"), ("2", "Bad"), ("3", "Normal"), ("4", "Good")],
         "ai_unsched_factor" => vec![("25", "25%"), ("50", "50%"), ("75", "75%"), ("100", "100%"), ("150", "150%"), ("200", "200%")],
         "ai_max_scheduled" => vec![("0", "All"), ("10", "At most 10"), ("25", "At most 25"), ("50", "At most 50")],
-        "ai_max_parked" => vec![("-1", "None"), ("0", "Every space"), ("35", "At most 35"), ("100", "At most 100"), ("250", "At most 250")],
+        "ai_parked_pct" => vec![("0", "None"), ("25", "25% of spaces"), ("50", "50% of spaces"), ("75", "75% of spaces"), ("90", "90% of spaces"), ("100", "Every space")],
         "language" => omsi_launcher_lib::LANGUAGES.iter().map(|l| (l.0, l.1)).collect(),
         "vr_scale" => vec![("0.5", "50%"), ("0.65", "65%"), ("0.8", "80%"), ("1", "100%")],
         "vr_head_smoothing_ms" => vec![("0", "Off"), ("5", "5 ms"), ("10", "10 ms"), ("20", "20 ms"), ("30", "30 ms")],
@@ -2451,11 +2559,7 @@ fn sync_live(app: &mut App) {
         h.exact_fare = s.exact_fare;
         h.boarding = s.boarding.clone();
         h.sit_bias = s.pax_sit;
-        h.voices = match s.pax_voices.as_str() {
-            "off" => 2,
-            "tickets" => 1,
-            _ => 0,
-        };
+        h.voices = s.pax_voice_mask();
     }
 }
 
@@ -2473,7 +2577,6 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "nav_arrows", "Route arrows (as in OMSI 2)", "Shows OMSI 2's route arrows over the road"),
         switch_row(app, "nav_arrows_auto", "Generated route arrows", "With the route arrows on, also puts arrows over the junctions and stops of the route ahead (the map's own arrows show either way)"),
         pick("navigator_corner", "Corner", later),
-        switch_row(app, "get_up", "Ability to get up (Ctrl+Shift+G)", "Allows you to get out of the car and explore the world"),
         switch_row(app, "coll_objects", "Collisions with objects", "Enables/disables collisions with objects such as buildings, streetlights, etc."),
         switch_row(app, "coll_vehicles", "Collisions with vehicles", "Enables/Disables Collisions with Other Vehicles"),
         switch_row(app, "collision_pedestrians", "Collisions with people", "Enables/disables knocking down people"),
@@ -2482,10 +2585,14 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "exact_fare", "Passengers pay the exact fare", "No change is given at the cash desk"),
         switch_row(app, "trip_summary", "Show a summary after each trip", "A window with the trip's stops and times comes up when a trip is over"),
         pick("boarding", "Boarding", "How passengers get their tickets"),
+        // [ROLLBACK paxvoice-99]
+        switch_row(app, "pax_greet", "Passengers greet the driver", "They say hello (Guten Tag...) when boarding"),
+        switch_row(app, "pax_ticket", "Passengers say which ticket they want", "They name the ticket when buying it from the driver"),
+        switch_row(app, "pax_complain", "Passengers complain", "They grumble about the weather, the time, the driving"),
         pick("maintenance", "Maintenance", later),
         pick("ai_unsched_factor", "Random traffic", later),
-        pick("ai_max_scheduled", "Timetable vehicles", later),
-        pick("ai_max_parked", "Parked cars", later),
+        pick("ai_max_scheduled", "Max timetable vehicles", later),
+        pick("ai_parked_pct", "Parked cars", later),
     ]
         .into_iter()
         .flatten()
@@ -2605,7 +2712,6 @@ fn options_pages(app: &App) -> Vec<Page> {
         slider_row(app, "radio_fx_noise", "Radio: FM hiss and crackle", "Noise of a weak FM reception (0 = off)", &fx_fmt),
         slider_row(app, "radio_fx_dropouts", "Radio: lost reception", "Now and then the station fades out for a moment (0 = off)", &fx_fmt),
         switch_row(app, "doppler", "Doppler effect", "Approaching sounds higher, receding ones lower"),
-        pick("pax_voices", "Passenger voices", "What passengers say"),
     ]
         .into_iter()
         .flatten()
@@ -2648,7 +2754,10 @@ fn options_pages(app: &App) -> Vec<Page> {
                 .flatten(),
         );
     }
+    // [ROLLBACK declutter-126] the keys and the game controllers: from here, no line of their own in the game menu
     let controls: Vec<(String, String)> = vec![
+        Some(opens("Keyboard", "Change driving, vehicle, game and camera key bindings", "keyboard")),
+        Some(opens("Game controllers", "Configure wheels, pedals, gamepads and force feedback", "controllers")),
         pick("drive_keys", "Driving keys", "Which keys drive the vehicle"),
         switch_row(app, "mouse", "Steering with the mouse", "Steer and control the pedals using the mouse"),
         switch_row(app, "mouse_right", "A right click ends the mouse steering", "As in OMSI; off: the right button only looks round"),
@@ -2721,8 +2830,8 @@ fn vehicle_pages(app: &App) -> Vec<Page> {
         display.push(opens("Driver", "Change the current driver profile", "driver"));
     }
     let mut fleet: Vec<(String, String)> = Vec::new();
-    if has || !app.placed.is_empty() {
-        fleet.push(button("Drive the next vehicle", "Switch", "Take the wheel of another vehicle standing in the world", "switch"));
+    if !app.placed.is_empty() || (has && app.on_foot.is_some()) {
+        fleet.push(opens("Drive another vehicle", "Choose a vehicle standing in the world to take the wheel of", "switch"));
     }
     fleet.push(opens("Place a vehicle", "Place a vehicle of your choice", "place"));
     if has {
@@ -2756,96 +2865,227 @@ fn vehicle_pages(app: &App) -> Vec<Page> {
 }
 
 fn world_pages(app: &App) -> Vec<Page> {
-    let client = app.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client);
+    // [ROLLBACK walkmenus-125] Time, Weather (the weather and the temperature and wind in one) and
+    // the METAR: rows without a second line, so that a page fits the window; the tools and the
+    // traffic and people pages are gone (the traffic is cleared from the game menu).
+    let client = app
+        .lan
+        .as_ref()
+        .is_some_and(|l| l.role == omsi_net::Role::Client);
     let pct = |v: f32| format!("{:.0} %", v * 100.0);
     let mut time: Vec<(String, String)> = Vec::new();
     let mut weather: Vec<(String, String)> = Vec::new();
-    let mut climate: Vec<(String, String)> = Vec::new();
-    let mut tools: Vec<(String, String)> = Vec::new();
+    let mut metar: Vec<(String, String)> = Vec::new();
     if !client {
         let t = app.clock.time;
-        let now = format!("{:02}:{:02}", ((t / 3600.0) as i64).rem_euclid(24), ((t / 60.0) as i64) % 60);
-        time.extend(switch_row(app, "time_sync", "Real-time sync", "The game follows your device's date and time"));
+        let secs = (t as i64).rem_euclid(86400);
+        let hm = |s: f64| {
+            format!(
+                "{:02}:{:02}",
+                ((s / 3600.0) as i64).rem_euclid(24),
+                ((s / 60.0) as i64) % 60
+            )
+        };
         if app.real_time_locked() {
             let (d, m) = app.clock.day_month();
-            let text = format!("{:04}-{m:02}-{d:02}  {}:{:02}", app.clock.year, now, (t as i64) % 60);
-            time.push((row("Date and time", 'i', &text, "Synchronized with the real time", None), "noop".to_string()));
+            let text = format!(
+                "{:04}-{m:02}-{d:02}  {:02}:{:02}:{:02}",
+                app.clock.year,
+                secs / 3600,
+                secs / 60 % 60,
+                secs % 60
+            );
+            time.push((
+                row("Date and time", 'i', &text, "", None),
+                "noop".to_string(),
+            ));
         } else {
-            // the exact time: typed as hours, minutes and seconds
+            // the clock, large: a click types a time (12 is 12:00:00, 12:30 is 12:30:00)
             match app.menu_edit.as_ref() {
                 Some(d) => {
-                    let mut c: Vec<char> = d.chars().collect();
-                    c.resize(6, '_');
-                    let typed = format!("{}{}:{}{}:{}{}", c[0], c[1], c[2], c[3], c[4], c[5]);
-                    time.push((row("Exact time", 'E', &typed, "Press Enter to change, Esc to cancel", None), "time_edit".to_string()));
+                    let typed = if d.is_empty() {
+                        "hh:mm:ss".to_string()
+                    } else {
+                        format!("{d}_")
+                    };
+                    time.push((row("Time", 'U', &typed, "", None), "time_edit".to_string()));
                 }
                 None => {
-                    let secs = format!("{}:{:02}", now, (t as i64) % 60);
-                    time.push((row("Exact time", 'e', &secs, "Change the current time (Press Enter to change)", None), "time_edit".to_string()));
+                    let text = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+                    time.push((row("Time", 'T', &text, "", None), "time_edit".to_string()));
                 }
             }
-            time.extend(slider_row(app, "hour", "Hour", "Set the hour of the day directly", &|v| format!("{:02}", v as i64)));
-            time.extend(slider_row(app, "minute", "Minute", "Set the minute directly", &|v| format!("{:02}", v as i64)));
-            for (name, hm, secs) in [("Morning", "06:00", 6 * 3600), ("Noon", "12:00", 12 * 3600), ("Evening", "18:00", 18 * 3600), ("Night", "23:00", 23 * 3600)] {
-                time.push(button(name, hm, "Jump to this time of day.", &format!("clock_set {secs}")));
-            }
+            // morning and evening: the sun's rise and set today at the map's place
+            let (rise, set) = app.sun_times().unwrap_or((6.0 * 3600.0, 18.0 * 3600.0));
+            let tod = [
+                format!("{} {}", omsi_ui::tr("Morning"), hm(rise)),
+                format!("{} 12:00", omsi_ui::tr("Noon")),
+                format!("{} {}", omsi_ui::tr("Evening"), hm(set)),
+                format!("{} 00:00", omsi_ui::tr("Night")),
+            ];
+            time.push((
+                row("Time of day", 'g', &tod.join("\u{1e}"), "", None),
+                "tod".to_string(),
+            ));
+            let adj = ["−1 h", "+1 h", "−1 min", "+1 min", "−1 s", "+1 s"];
+            time.push((
+                row("Adjust", 'g', &adj.join("\u{1e}"), "", None),
+                "tadj".to_string(),
+            ));
+            time.extend(slider_row(app, "hour", "Hour", "", &|v| {
+                format!("{:02}", v as i64)
+            }));
+            time.extend(slider_row(app, "minute", "Minute", "", &|v| {
+                format!("{:02}", v as i64)
+            }));
             if let (Some(_), Some(p)) = (app.duty.as_ref(), app.player.as_ref()) {
                 let d = p.vehicle.host.tt_delay as f64;
                 if d.abs() >= 1.0 {
-                    let text = format!("{}{}:{:02}", if d < 0.0 { "−" } else { "+" }, (d.abs() / 60.0) as i64, d.abs() as i64 % 60);
-                    time.push(button("On time with the timetable", &text, "Move the clock so that the vehicle is on time", "clock_ontime"));
+                    let text = format!(
+                        "{}{}:{:02}",
+                        if d < 0.0 { "−" } else { "+" },
+                        (d.abs() / 60.0) as i64,
+                        d.abs() as i64 % 60
+                    );
+                    time.push(button(
+                        "On time with the timetable",
+                        &text,
+                        "",
+                        "clock_ontime",
+                    ));
                 }
             }
-            if app.lan.is_none() {
-                time.extend(slider_row(app, "speed", "Time speed", "How fast the world's clock runs", &|v| format!("x{v}")));
-            }
         }
-        weather.extend(switch_row(app, "metar_sync", "METAR sync", "The weather follows the real METAR report"));
-        let src = if app.settings.metar_station.is_empty() { format!("{} ({})", app.metar_station(), omsi_ui::tr("automatic")) } else { app.metar_station() };
-        weather.push((row("METAR source", 'o', &src, "The airport used for real weather.", None), "metar_src".to_string()));
-        let typed=if app.menu_edit_icao{
-            let mut s=app.menu_edit.clone().unwrap_or_default(); while s.len()<4{s.push('_');} format!("{s}  (typing)")
-        }else{app.metar_station()};
-        weather.push((row("ICAO",if app.menu_edit_icao{'E'}else{'e'},&typed,"Enter any 4-letter ICAO station.",None),"metar_icao_edit".to_string()));
+        time.extend(switch_row(app, "time_sync", "Real-time sync", ""));
         if app.metar_locked() {
-            weather.push(button("METAR report", "Refresh now", "Fetch the selected station again without waiting for the next automatic update.", "metar_refresh"));
+            weather.push((
+                row(
+                    "Weather",
+                    'i',
+                    &omsi_ui::tr("follows the METAR report"),
+                    "",
+                    None,
+                ),
+                "noop".to_string(),
+            ));
         } else {
-            weather.push(button("METAR report", "Load once", "Load the selected station once without enabling continuous METAR sync.", "metar_once"));
+            weather.push((
+                row("Preset", 'o', &weather_name(app), "", None),
+                "weather".to_string(),
+            ));
+            let cloud = app
+                .weather
+                .as_ref()
+                .and_then(|w| cloud_index(&w.clouds.0))
+                .map(|i| CLOUD_TYPES[i].1.to_string())
+                .or_else(|| app.weather.as_ref().map(|w| w.clouds.0.trim().to_string()))
+                .unwrap_or_default();
+            weather.push((
+                row("Clouds", 'o', &cloud, "", None),
+                "cloudkind".to_string(),
+            ));
+            let kind = app
+                .weather
+                .as_ref()
+                .map(|w| {
+                    (w.precip.first().copied().unwrap_or(0.0).max(0.0) as usize)
+                        .min(PRECIP_KINDS.len() - 1)
+                })
+                .unwrap_or(0);
+            weather.push((
+                row("Precipitation", 'o', PRECIP_KINDS[kind], "", None),
+                "precipkind".to_string(),
+            ));
+            weather.extend(slider_row(
+                app,
+                "rain_amt",
+                "Precipitation strength",
+                "",
+                &pct,
+            ));
+            weather.extend(slider_row(app, "wet", "Wet roads", "", &pct));
+            let snow =
+                [("snow_cover", "Snow cover"), ("snow_road", "Snow on road")].map(|(id, name)| {
+                    format!(
+                        "{}{}",
+                        if switch_on(app, id) { "*" } else { "" },
+                        omsi_ui::tr(name)
+                    )
+                });
+            weather.push((
+                row("Snow", 'g', &snow.join("\u{1e}"), "", None),
+                "snow".to_string(),
+            ));
+            weather.extend(slider_row(app, "visibility", "Visibility", "", &|v| {
+                if v >= 1000.0 {
+                    format!("{:.1} km", v / 1000.0)
+                } else {
+                    format!("{} m", v as i64)
+                }
+            }));
+            weather.extend(slider_row(app, "brightness", "Brightness", "", &|v| {
+                format!("{:.0} %", v * 100.0)
+            }));
+            weather.extend(slider_row(app, "temp", "Temperature", "", &|v| {
+                format!("{} °C", v as i64)
+            }));
+            let dew_temp = app.weather.as_ref().map(|w| w.temp.0).unwrap_or(15.0);
+            weather.extend(slider_row(app, "humidity", "Humidity", "", &|v| {
+                format!(
+                    "{:.0} % · dew {:.0} °C",
+                    v,
+                    crate::weather_setup::dew_point_c(dew_temp, v)
+                )
+            }));
+            weather.extend(slider_row(app, "wind_speed", "Wind speed", "", &|v| {
+                format!("{} m/s", v as i64)
+            }));
+            weather.extend(slider_row(app, "wind_dir", "Wind direction", "", &|v| {
+                format!("{}°", v as i64)
+            }));
+            weather.push(button(
+                "Custom weather",
+                "Edit current",
+                "",
+                "weather_custom",
+            ));
         }
-        weather.push((row("Preset", 'o', &weather_name(app), "A ready-made weather", None), "weather".to_string()));
-        if !app.metar_locked() {
-            weather.push(button("Custom weather", "Edit current", "Freeze the weather currently in force and edit it as a custom weather.", "weather_custom"));
-        }
-        let cloud = app.weather.as_ref().and_then(|w| cloud_index(&w.clouds.0)).map(|i| CLOUD_TYPES[i].1.to_string()).or_else(|| app.weather.as_ref().map(|w| w.clouds.0.trim().to_string())).unwrap_or_default();
-        weather.push((row("Clouds", 'o', &cloud, "The kind of clouds in the sky.", None), "cloudkind".to_string()));
-        weather.extend(slider_row(app, "visibility", "Visibility", "How far one can see; less is fog.", &|v| if v >= 1000.0 { format!("{:.1} km", v / 1000.0) } else { format!("{} m", v as i64) }));
-        weather.extend(slider_row(app,"brightness","Brightness","Brightness of the custom weather lighting.",&|v|format!("{:.0} %",v*100.0)));
-        let kind = app.weather.as_ref().map(|w| (w.precip.first().copied().unwrap_or(0.0).max(0.0) as usize).min(PRECIP_KINDS.len() - 1)).unwrap_or(0);
-        weather.push((row("Precipitation", 'o', PRECIP_KINDS[kind], "Rain or snow.", None), "precipkind".to_string()));
-        weather.extend(slider_row(app, "rain_amt", "Precipitation strength", "How hard it rains or snows.", &pct));
-        weather.extend(slider_row(app, "wet", "Wet roads", "How wet the roads are now (they dry in the sun, wet in the rain).", &pct));
-        weather.extend(switch_row(app,"snow_cover","Snow cover","Snow lying on the world and ground."));
-        weather.extend(switch_row(app,"snow_road","Snow on road","Treat the road surface as snow-covered."));
-        climate.extend(slider_row(app, "temp", "Temperature", "The air temperature.", &|v| format!("{} °C", v as i64)));
-        let dew_temp=app.weather.as_ref().map(|w|w.temp.0).unwrap_or(15.0);
-        climate.extend(slider_row(app,"humidity","Humidity","Relative humidity of the air.",&|v|format!("{:.0} % · dew {:.0} °C",v,crate::weather_setup::dew_point_c(dew_temp,v))));
-        climate.extend(slider_row(app, "wind_speed", "Wind speed", "How fast the wind blows; it drives the clouds.", &|v| format!("{} m/s", v as i64)));
-        climate.extend(slider_row(app, "wind_dir", "Wind direction", "The direction of the wind in degrees (0 is north).", &|v| format!("{}°", v as i64)));
-        // the METAR sync on: only its own rows stay (the weather is the report's)
+        metar.extend(switch_row(app, "metar_sync", "METAR sync", ""));
+        let src = if app.settings.metar_station.is_empty() {
+            format!("{} ({})", app.metar_station(), omsi_ui::tr("automatic"))
+        } else {
+            app.metar_station()
+        };
+        metar.push((
+            row("METAR source", 'o', &src, "", None),
+            "metar_src".to_string(),
+        ));
+        let typed = if app.menu_edit_icao {
+            let mut s = app.menu_edit.clone().unwrap_or_default();
+            while s.len() < 4 {
+                s.push('_');
+            }
+            format!("{s}  (typing)")
+        } else {
+            app.metar_station()
+        };
+        metar.push((
+            row(
+                "ICAO",
+                if app.menu_edit_icao { 'E' } else { 'e' },
+                &typed,
+                "",
+                None,
+            ),
+            "metar_icao_edit".to_string(),
+        ));
         if app.metar_locked() {
-            weather.retain(|r| matches!(r.1.as_str(), "metar_sync" | "metar_src" | "metar_icao_edit" | "metar_refresh"));
-            climate.clear();
+            metar.push(button("METAR report", "Refresh now", "", "metar_refresh"));
+        } else {
+            metar.push(button("METAR report", "Load once", "", "metar_once"));
         }
-        tools.push(button("Object editor", "Open", "Place and move objects in the world.", "editor"));
     }
-    let mut people: Vec<(String, String)> = Vec::new();
-    people.extend(slider_row(app, "traffic", "Traffic", "How many vehicles drive around the map.", &|v| format!("{} vehicles", v as i64)));
-    if !client && app.traffic.is_some() {
-        people.push(button("Clear AI traffic", "Clear", "Remove the current AI cars from the road; random traffic will return automatically.", "traffic_clear"));
-    }
-    people.extend(slider_row(app, "pax", "Passengers", "How many passengers wait at the stops and ride.", &pct));
-    people.extend(slider_row(app, "pax_sit", "Passengers' wish to sit", "How eagerly boarding passengers look for a seat (Original: a random free place).", &|v| if v < 0.025 { "Original".to_string() } else { format!("{v:.2}x") }));
-    vec![("Time", time), ("Weather", weather), ("Temperature and wind", climate), ("Traffic and people", people), ("Tools", tools)]
+    vec![("Time", time), ("Weather", weather), ("METAR", metar)]
 }
 
 /// The pages of the settings window `kind` (empty ones left out) and the one shown.
@@ -2877,7 +3117,8 @@ pub(crate) fn ensure_schedule(app: &mut App) {
         return;
     }
     let Some(w) = app.world.clone() else { return };
-    let sch = crate::schedule::Schedule::new(&app.args.root, &w, &app.clock);
+    // [ROLLBACK schedlist-123] the lists need the timetable, not the depots' vehicle models
+    let sch = crate::schedule::Schedule::new_for_lists(&app.args.root, &w, &app.clock);
     app.schedule = Some(sch);
 }
 

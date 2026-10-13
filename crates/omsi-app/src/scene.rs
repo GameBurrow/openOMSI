@@ -2073,6 +2073,12 @@ pub struct World {
     /// (0 = every space the map fills, -1 = none): past it the spaces stay empty.
     pub parked_live: std::sync::atomic::AtomicUsize,
     pub parked_max: i64,
+    /// [ROLLBACK parkedpct-98] percent of the car park spaces that hold a car
+    pub parked_pct: i64,
+    /// [ROLLBACK parked-95] What makes the parked cars differ from one run - and one load of a
+    /// tile - to the next: a salt drawn at the start and a count of the car parks placed.
+    pub park_salt: u64,
+    pub park_seq: std::sync::atomic::AtomicU64,
     /// Places that echo (`[triggerbox_new]` + `[triggerbox_setreverb]`: the railway bridges'
     /// underpasses): the box, the reverberation time (s) and the distance (m) over which it
     /// fades in at the box's sides.
@@ -2933,6 +2939,9 @@ impl World {
             light_map_atlas: Mutex::new(None),
             parked_live: std::sync::atomic::AtomicUsize::new(0),
             parked_max: crate::settings::Settings::load().ai_max_parked as i64,
+            parked_pct: crate::settings::Settings::load().ai_parked_pct as i64,
+            park_salt: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0x5eed),
+            park_seq: std::sync::atomic::AtomicU64::new(0),
             signal_routes,
             particle_objects: Mutex::new(HashMap::new()),
             fonts: Arc::new(Mutex::new(omsi_sim::texttex::FontLibrary::new(root))),
@@ -4366,11 +4375,19 @@ impl World {
         if list.is_empty() {
             return Some((ot, false));
         }
-        let h = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33;
-        // leave some spaces empty like the original, and all once the options' count of
-        // parked cars stands
-        let full = self.parked_max < 0 || (self.parked_max > 0 && self.parked_live.load(std::sync::atomic::Ordering::Relaxed) as i64 >= self.parked_max);
-        if h % 4 == 0 || full {
+        // [ROLLBACK parked-95] drawn anew each run and each time a tile comes in (splitmix64),
+        // not from the object's id alone: the same cars stood in the same car parks for ever
+        let seq = self.park_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut z = (key as u64) ^ self.park_salt ^ seq.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let h = (z ^ (z >> 31)) >> 1;
+        // [ROLLBACK parkedpct-98] the options' share of the spaces holds a car, each space drawn on
+        // its own, as in Omsi.exe: no count of cars over the map (a count filled the tiles
+        // that loaded first and left the ones after them bare)
+        let share = self.parked_pct.clamp(0, 100) as u64;
+        if (h >> 8) % 100 >= share {
             stats.lock().empty_spaces += 1;
             return None;
         }
@@ -6285,8 +6302,24 @@ impl World {
                     Some((name, _)) => tex_of(gpu, scene, &name, &mut t),
                     None => None,
                 };
+                // [ROLLBACK helparrow-110] a route arrow (`[helparrow]`) is full bright by day and
+                // by night in Omsi.exe: drawn as an unlit surface here, at its diffuse plus its
+                // emissive colour, as a display is - not as something that shines (its emissive
+                // colour, taken for a light, burned over the exposure and bloomed into the glow)
+                let arrow = ot.sco.is_help_arrow;
+                let color = if arrow {
+                    [
+                        (color[0] + emissive[0]).min(1.0),
+                        (color[1] + emissive[1]).min(1.0),
+                        (color[2] + emissive[2]).min(1.0),
+                        color[3],
+                    ]
+                } else {
+                    color
+                };
                 let base = renderer.add_material_extra(
-                    scene, tex, alpha, color, false, transmap, night, light, envmap, emissive, extra,
+                    scene, tex, alpha, color, arrow, transmap, night, light, envmap, emissive,
+                    extra,
                 );
                 let base = gpu.material(renderer, scene, base);
                 t.materials.push(base);
@@ -7432,7 +7465,11 @@ impl World {
                                         .unwrap_or_default();
                                     let alpha = text_alpha(o3d_mats, slot, overrides);
                                     let emissive = text_emissive(o3d_mats, slot, overrides);
-                                    let key = scenery_text_key(tt, &text, alpha, emissive);
+                                    // [ROLLBACK helparrow-111] a route arrow's text is full bright as its
+                                    // picture is (an unlit material, own key)
+                                    let arrow = ot.sco.is_help_arrow;
+                                    let key = scenery_text_key(tt, &text, alpha, emissive)
+                                        + if arrow { "|arrow" } else { "" };
                                     if let Some(e) = gpu.text_textures.get_mut(&key) {
                                         e.2 += 1;
                                         let mat = e.1;
@@ -7460,7 +7497,7 @@ impl World {
                                         Some(tex),
                                         alpha,
                                         [1.0; 4],
-                                        false,
+                                        arrow,
                                         None,
                                         None,
                                         None,
@@ -8125,7 +8162,8 @@ impl World {
                 let text = tt.variable.trim().parse::<usize>().ok().and_then(|k| strings.get(k)).cloned().unwrap_or_default();
                 let alpha = text_alpha(o3d_mats, slot, overrides);
                 let emissive = text_emissive(o3d_mats, slot, overrides);
-                                    let key = scenery_text_key(tt, &text, alpha, emissive);
+                // [ROLLBACK helparrow-111] the game's own route arrows: the text full bright (unlit)
+                let key = scenery_text_key(tt, &text, alpha, emissive) + "|arrow";
                 if let Some(e) = gpu.text_textures.get_mut(&key) {
                     e.2 += 1;
                     let mat = e.1;
@@ -8136,7 +8174,7 @@ impl World {
                 let atlas = self.fonts.lock().get(&tt.font, &|p| omsi_texture::decode_file(p).ok().map(|i| (i.width, i.height, i.rgba)));
                 let image = helper_text_image(tt, atlas.as_deref(), &text).unwrap_or_else(|| scenery_text_image(tt, atlas, &text));
                 let tex = gpu.add_image(renderer, scene, &image, true);
-                let mat = renderer.add_material_all(scene, Some(tex), alpha, [1.0; 4], false, None, None, None, None, emissive);
+                let mat = renderer.add_material_all(scene, Some(tex), alpha, [1.0; 4], true, None, None, None, None, emissive);
                 let mat = gpu.material(renderer, scene, mat);
                 gpu.text_textures.insert(key.clone(), (tex, mat, 1));
                 tg.texts.push(key);
@@ -9664,7 +9702,13 @@ impl World {
                     .collect();
                 texture_updates.push((o.ty.clone(), selection, o.instances.clone(), switches));
             }
+            // [ROLLBACK helparrow-109] a scripted `[helparrow]` object (a map's own route
+            // arrow with a script) had its meshes switched on again by its script's
+            // visibility every frame, over the hiding `World::show_help_arrows` does: it is
+            // shown only while the route arrows are on
+            let arrow_off = o.ty.sco.is_help_arrow && !self.help_arrows_shown.load(std::sync::atomic::Ordering::Relaxed);
             for ((inst, xf), &visible) in o.instances.iter().zip(&o.inst.mesh_transforms).zip(&o.inst.mesh_visible) {
+                let visible = visible && !arrow_off;
                 renderer.set_transform(scene, *inst, o.pos, o.xf * *xf);
                 let p = &mut scene.instances[*inst];
                 if p.visible != visible {
@@ -9778,6 +9822,7 @@ impl World {
                     log::info!("scenery sound {}: {} sounds ({:.0} m away)", path.display(), cfg.sounds.len(), dist);
                     let mut ss = omsi_audio::SoundSet::new(a, &cfg, &sdir);
                     ss.master = crate::sound_gain(&crate::SOUND_SCENERY);
+                    ss.set_ambient(true); // [ROLLBACK ambient-96]
                     *sounds = Some(ss);
                 }
             }
@@ -12888,6 +12933,11 @@ fn spline_lanes(
         let no_cars = s.rules.iter().any(|r| {
             r.path_index == pi as i32 && r.kind.eq_ignore_ascii_case("no_cars") && !r.kill
         });
+        // [ROLLBACK unsched-93] "no unscheduled traffic": a rule of that name, or a nonzero
+        // extra field of `[path_2]`
+        let no_unsched = s.rules.iter().any(|r| r.path_index == pi as i32 && r.kind.to_ascii_lowercase().contains("unsched") && !r.kill)
+            || p.params.first().is_some_and(|x| *x == 1.0);
+        let no_cars = no_cars || no_unsched;
         // (`bus` and `trucks` are switches that open the path to those AI vehicles, see
         // `Lane::allows`; `bus` does not close it to cars)
         let rule_bus = rule_of("bus").is_some();
@@ -12904,6 +12954,7 @@ fn spline_lanes(
             l.density = density;
             l.group_density = group_density.clone();
             l.no_cars = no_cars;
+            l.no_unsched = no_unsched;
             l.rule_bus = rule_bus;
             l.rule_trucks = rule_trucks;
             l.source = 1;
@@ -13017,6 +13068,11 @@ fn object_lanes(
                 && r.kind.eq_ignore_ascii_case("no_cars")
                 && !r.kill
         });
+        // [ROLLBACK unsched-93] "no unscheduled traffic" (see the spline's)
+        let no_unsched = rules.iter().any(|r| r.path_index == pi as i32 && r.kind.to_ascii_lowercase().contains("unsched") && !r.kill)
+            || v.get(12).is_some_and(|x| *x == 1.0)
+            || v.get(13).is_some_and(|x| *x == 1.0);
+        let no_cars = no_cars || no_unsched;
         let rule_bus = rule_of("bus").is_some();
         let rule_trucks = rule_of("trucks").is_some();
         // who goes first where this path meets another (`Network::must_yield`)
@@ -13033,6 +13089,7 @@ fn object_lanes(
             l.density = density;
             l.group_density = group_density.clone();
             l.no_cars = no_cars;
+            l.no_unsched = no_unsched;
             l.rule_bus = rule_bus;
             l.rule_trucks = rule_trucks;
             l.turn = turn;

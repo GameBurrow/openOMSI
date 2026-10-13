@@ -46,6 +46,9 @@ struct Shown {
     /// Centre and size of the bus (its bounding box).
     centre: glam::Vec3,
     length: f32,
+    /// [ROLLBACK showroom-119] the widest and the tallest of the sections (m)
+    width: f32,
+    height: f32,
     weather: omsi_content::weather::Weather,
     lighting: Lighting,
 }
@@ -290,16 +293,26 @@ impl Showroom {
         let bb = r.vt.def.bounding_box.unwrap_or([2.5, 12.0, 3.0, 0.0, 0.0, 1.5]);
         let mut length = bb[1];
         let mut centre = glam::Vec3::new(bb[3], bb[4], bb[5]);
+        // [ROLLBACK showroom-119] the whole group from the front of the first section to the back of the
+        // last one (before: the length counted from the first one's origin as if that were its middle, which
+        // put the pivot off the group's middle and cut the front off when the camera turned)
+        let (mut width, mut height) = (bb[0], bb[2]);
+        let front = bb[4] + bb[1] * 0.5;
+        let mut rear = bb[4] - bb[1] * 0.5;
         for t in &vehicle.trailers {
             let tb = t.ty.def.bounding_box.unwrap_or([2.5, 8.0, 3.0, 0.0, 0.0, 1.5]);
-            let back = (t.position - vehicle.position).truncate().length() as f32 + tb[1] * 0.5;
-            let total = bb[1] * 0.5 + back;
-            centre.y = bb[4] + bb[1] * 0.5 - total * 0.5;
-            length = total;
+            let behind = (t.position - vehicle.position).truncate().length() as f32;
+            rear = rear.min(-behind + tb[4] - tb[1] * 0.5);
+            width = width.max(tb[0]);
+            height = height.max(tb[2]);
+        }
+        if !vehicle.trailers.is_empty() {
+            centre.y = (front + rear) * 0.5;
+            length = front - rear;
         }
         let lighting = lighting_for(&args, &weather);
         log::info!("showroom: {} ({} meshes, {:.1} m long) placed in {:.2} s", r.look.bus, render.instances.len(), length, t0.elapsed().as_secs_f64());
-        Shown { look: r.look, scene, world: Some(world), vehicle: Some(vehicle), render: Some(render), trailers, centre, length, weather, lighting }
+        Shown { look: r.look, scene, world: Some(world), vehicle: Some(vehicle), render: Some(render), trailers, centre, length, width, height, weather, lighting }
     }
 
     /// The picture of the bus at `w` x `h` pixels, drawn again when something changed.
@@ -340,8 +353,16 @@ impl Showroom {
         // (the free part is the share of the window right of the panels: twice the room
         // from the focus to the right edge)
         let free = ((1.0 - focus) * 2.0).clamp(0.3, 1.0);
-        let fit = (s.length * 0.5 + 1.0) / (half_v * aspect * free * 0.92).max(0.1);
-        let dist = (fit * zoom).max(8.0);
+        // [ROLLBACK showroom-119] far enough that the sphere round the whole vehicle (about the point the camera
+        // turns on) fits the free part of the picture from every side - before: the length alone, with a metre
+        // to spare, so a three-quarter view put the nearer end past the edge. The distance does not change
+        // as the camera turns.
+        let (sx, sz) = (s.width * 0.5, s.height * 0.5 + s.centre.z * 0.25);
+        let radius = ((s.length * 0.5).powi(2) + sx * sx + sz * sz).sqrt() + 0.5;
+        let half_h = (half_v * aspect * free).atan();
+        let half_limit = half_h.min(half_v.atan()).max(0.05);
+        let fit = radius / half_limit.sin();
+        let dist = (fit * 1.04 * zoom).max(8.0);
         let (sy, cy) = yaw.to_radians().sin_cos();
         let (sp, cp) = pitch.to_radians().sin_cos();
         let target_pt = DVec3::new(s.centre.x as f64, s.centre.y as f64, (s.centre.z * 0.75) as f64);

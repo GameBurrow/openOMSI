@@ -716,6 +716,17 @@ pub(crate) fn guard_fall(app: &mut App, dt: f32) {
         None => (None, None),
     };
     app.safe_age += dt;
+    // [ROLLBACK safepose-123] The place it last stood is only the bus's own when it is near: a
+    // jump to an entry point, to the map's place or to another vehicle (the one driven now is
+    // not the one the pose was taken from) leaves it far away, and the bus - its tiles still
+    // to be read, no ground yet - was "put back" there, to the other vehicle's side.
+    if app
+        .safe_pose
+        .is_some_and(|s| (s.0.truncate() - at.truncate()).length() > 150.0)
+    {
+        app.safe_pose = None;
+        app.safe_age = 0.0;
+    }
     let fallen = match (under, ground) {
         (Some(_), _) => false,
         (None, Some(g)) => at.z < g - 8.0,
@@ -726,6 +737,16 @@ pub(crate) fn guard_fall(app: &mut App, dt: f32) {
             log::warn!("the bus fell through the world at ({:.1}, {:.1}, {:.1}): put back at ({:.1}, {:.1})", at.x, at.y, at.z, pos.x, pos.y);
             teleport(app, pos, heading);
             app.service_msg = Some(("The bus fell through the ground: it was put back where it last stood".into(), 5.0));
+        } else if ground.is_some() {
+            // (no pose of its own to go back to: up onto the ground where it is)
+            let heading = p.vehicle.heading;
+            log::warn!(
+                "the bus fell through the world at ({:.1}, {:.1}, {:.1}): put on the ground there",
+                at.x,
+                at.y,
+                at.z
+            );
+            teleport(app, glam::DVec3::new(at.x, at.y, 0.0), heading);
         }
         return;
     }

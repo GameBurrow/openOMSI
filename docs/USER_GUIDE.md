@@ -119,14 +119,14 @@ wheel button turns the view; each view keeps its own
 direction (turning the outside camera leaves the driver's head where it was), **Space** looks
 ahead again in every view (OMSI's `view_reset_all_directions`), Home recentres the view shown
 where keyboard.cfg does not make it the ticket desk camera.
-The mouse wheel (and **=** / **-**) zooms: outside the camera comes closer,
+The mouse wheel zooms (the keys for it are on the Controls page, "Zoom the view in / out", unassigned at first): outside the camera comes closer,
 inside the bus the view narrows, as in OMSI; **Ctrl**+wheel outside narrows the view instead
 (a telephoto, the camera stays where it is). F1-F4 driver / passenger / outside / map (free) camera, F5-F8 the destination
 sign and roller blind keys as in OMSI, Ctrl+S quick save, F9 write the run into the personnel
 file, WASD+QE in the free camera (a click on the ground there asks "Do you want to move the
 vehicle here?"; Yes, or Enter, puts the vehicle there - anywhere, not only on a street; No,
 Esc or a click elsewhere leaves it), left click on cockpit elements, **V** the chat line in a
-LAN session. Esc opens the game menu: drive the next placed vehicle, place any vehicle of
+LAN session. Esc opens the game menu: drive another of the placed vehicles (a list, also on the Alt menu), place any vehicle of
 the installation in front of the camera (or beside the bus), couple what stands close behind
 the bus and uncouple it again, save the situation or load the quicksave, the next weather, the clock an hour on or back, refuel and wash (only at a
 petrol station, as in OMSI), repair (the team needs the map's travel time when the bus stands

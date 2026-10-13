@@ -332,12 +332,35 @@ impl<'a> CfgReader<'a> {
         parse_i32(self.line())
     }
 
+    /// A fixed-length list of `n` whole numbers, read the careful way: OMSI takes exactly `n`
+    /// lines, so a file that gives fewer ran on into whatever followed, a blank line (read as
+    /// 0: a lamp that was never named) or the next block's keyword (eaten). Here a keyword
+    /// line ends the list (and stays for the next block), and a blank or non-numeric line is
+    /// a slot with nothing in it (-1). Every well-formed list reads as it always did.
+    pub fn i32_slots(&mut self, n: usize) -> Vec<i32> {
+        let mut v = Vec::with_capacity(n);
+        while v.len() < n && self.pos < self.file.lines.len() {
+            let raw = self.file.lines[self.pos].as_str();
+            if keyword_with(raw, self.rule).is_some() {
+                break;
+            }
+            let l = raw.trim();
+            self.pos += 1;
+            // (a number as Delphi reads one: a trailing comment or a ".0" is no hindrance)
+            let first = l.split_whitespace().next().unwrap_or("");
+            let number = first.chars().next().is_some_and(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.'))
+                && first.replace(',', ".").parse::<f64>().is_ok_and(|x| x.is_finite());
+            v.push(if number { parse_i32(l) } else { -1 });
+        }
+        v
+    }
+
     /// `n` integers, then any further whole-number lines that follow at once (a blank line,
     /// a keyword or anything else ends the list): OMSI's fixed-length lists read as always,
     /// and a file may give more (openOMSI: `[illumination_interior]` with more than four
     /// lamps).
     pub fn i32_list(&mut self, n: usize) -> Vec<i32> {
-        let mut v: Vec<i32> = (0..n).map(|_| self.i32()).collect();
+        let mut v = self.i32_slots(n);
         while self.pos < self.file.lines.len() {
             let l = self.file.lines[self.pos].trim();
             let whole = !l.is_empty() && l.strip_prefix('-').unwrap_or(l).chars().all(|c| c.is_ascii_digit());
@@ -778,10 +801,40 @@ pub fn read_dir_merged(rel: &str) -> Vec<PathBuf> {
     out
 }
 
+/// [ROLLBACK userpath-93] The folders of an OMSI installation a whole path can be cut at.
+const OMSI_FOLDERS: &[&str] = &[
+    "vehicles", "maps", "sceneryobjects", "splines", "texture", "fonts", "sound", "humans", "drivers", "airplanes", "weather", "archives", "inputs", "ticketpacks", "model",
+];
+
+/// [ROLLBACK userpath-93] For a path that names a place on somebody's disk (a drive letter, or
+/// `\Users\<name>\...`) that is not here: the part from the first OMSI folder on, as content is
+/// named. None for a relative path, for one that exists as written, and for one with no such
+/// folder in it.
+fn foreign_absolute_tail(rel: &str) -> Option<String> {
+    let t = rel.trim();
+    let b = t.as_bytes();
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+    let comps = windows_components(t);
+    let users = comps.first().is_some_and(|c| c.eq_ignore_ascii_case("users") || c.eq_ignore_ascii_case("home")) && comps.len() > 3;
+    if !(drive || users) {
+        return None;
+    }
+    if drive && Path::new(t).exists() {
+        return None;
+    }
+    let i = comps.iter().enumerate().skip(1).find(|(_, c)| OMSI_FOLDERS.iter().any(|f| c.eq_ignore_ascii_case(f)))?.0;
+    Some(comps[i..].join("/"))
+}
+
 /// The file a content file names (`rel`, relative to the folder `base`), found the way
 /// Windows finds it: see [`windows_components`] for the spelling rules, names compare without
 /// regard to case, and a mod's copy under a content root of higher priority comes first.
 pub fn resolve_path(base: &Path, rel: &str) -> PathBuf {
+    // [ROLLBACK userpath-93] a path saved whole on another machine (`C:\Users\<him>\OMSI 2\
+    // Vehicles\...`): the file is found under this machine's content from its OMSI folder on
+    if let Some(tail) = foreign_absolute_tail(rel) {
+        return resolve_path(base, &tail);
+    }
     let rel = windows_components(rel);
     let rel = rel.as_slice();
     // a mod's copy first: the same place under a content root of higher priority than the

@@ -70,6 +70,9 @@ struct CameraUniform {
     light_view_proj_lamp: [[f32; 4]; 4],
     /// and x 1 when it was drawn this frame, y its near and z its far plane (m), w its texel.
     lamp: [f32; 4],
+    /// [ROLLBACK rtparts-120] The player's coupled sections (up to 3) as boxes like `inside_*`: per
+    /// section origin and sin(heading); cos(heading) and the half extents; centre offset and 1.
+    parts: [[f32; 4]; 9],
 }
 
 /// The period the sky's cloud patterns repeat with (m): 5 x the cloud field (14 km), 8 x
@@ -960,6 +963,12 @@ impl Material {
             || self.transmap.map(|t| t.0) == Some(id)
             || self.env_mask == Some(id)
             || self.bump.map(|b| b.0) == Some(id)
+    }
+
+    /// A `[tree]`'s leaf card material (the 0.15 `MaterialUniform::params[1]` marks it).
+    /// [ROLLBACK tree-rt-92]
+    pub fn is_tree(&self) -> bool {
+        (self.uniform.params[1] - 0.15).abs() < 1e-4 && self.alpha == AlphaMode::Test
     }
 
     /// `[matl_transmap]` was given, its file there or not (the shader's
@@ -2015,6 +2024,10 @@ pub struct Renderer {
     camera_layout: wgpu::BindGroupLayout,
     material_layout: wgpu::BindGroupLayout,
     pass: PassPipelines,
+    /// Classic pass drawing into a non-sRGB view, so blending happens on encoded values.
+    pass_classic: Option<PassPipelines>,
+    gamma_blend: bool,
+    classic_format: wgpu::TextureFormat,
     hdr_pass: Option<PassPipelines>,
     reflection_pass: Option<PassPipelines>,
     corona_bind_group: wgpu::BindGroup,
@@ -2930,6 +2943,10 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
         };
+        let classic_format = format.remove_srgb_suffix();
+        let gamma_blend = format.is_srgb()
+            && classic_format != format
+            && !GL_BACKEND.load(std::sync::atomic::Ordering::Relaxed);
         let make = |format: wgpu::TextureFormat,
                     fs: &str,
                     blend: Option<wgpu::BlendState>,
@@ -2993,6 +3010,7 @@ impl Renderer {
                                 if use_alpha_to_coverage { 1.0 } else { 0.0 },
                             ),
                             ("TERRAIN_PAINT", if terrain_paint { 1.0 } else { 0.0 }),
+                            ("ENCODE_OUTPUT", if gamma_blend && format == classic_format { 1.0 } else { 0.0 }),
                         ],
                         ..Default::default()
                     },
@@ -3375,7 +3393,10 @@ impl Renderer {
                     module: &corona_shader,
                     entry_point: Some(fs),
                     targets: &color_targets(f, Some(blend), wgpu::ColorWrites::COLOR, false, false),
-                    compilation_options: Default::default(),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[("ENCODE_OUTPUT", if gamma_blend && f == classic_format { 1.0 } else { 0.0 })],
+                        ..Default::default()
+                    },
                 }),
                 multiview_mask: None,
                 cache: None,
@@ -3514,7 +3535,10 @@ impl Renderer {
                     module: &sky_shader,
                     entry_point: Some(fs),
                     targets: &color_targets(f, None, wgpu::ColorWrites::COLOR, false, false),
-                    compilation_options: Default::default(),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[("ENCODE_OUTPUT", if gamma_blend && f == classic_format { 1.0 } else { 0.0 })],
+                        ..Default::default()
+                    },
                 }),
                 multiview_mask: None,
                 cache: None,
@@ -3527,6 +3551,13 @@ impl Renderer {
             smoke_pipeline: corona_pipeline_for(format, "fs_smoke", alpha_blend),
             sky_pipeline: sky_pipeline_for(format, "fs_main"),
         };
+        let pass_classic = gamma_blend.then(|| PassPipelines {
+            pipelines: scene_pipelines(classic_format, "fs_main", msaa),
+            rain_pipelines: scene_pipelines(classic_format, "fs_main", 1),
+            corona_pipeline: corona_pipeline_for(classic_format, "fs_main", screen),
+            smoke_pipeline: corona_pipeline_for(classic_format, "fs_smoke", alpha_blend),
+            sky_pipeline: sky_pipeline_for(classic_format, "fs_main"),
+        });
         // the enhanced path: its own lighting in all three
         let leave_out_enhanced = options.no_enhanced && (cfg!(target_os = "android") || adapter_name.to_ascii_lowercase().contains("opengl") || GL_BACKEND.load(std::sync::atomic::Ordering::Relaxed));
         // (its textures do not fit OpenGL's units here, see `sixteen_texture_units`)
@@ -4587,6 +4618,9 @@ impl Renderer {
             camera_layout,
             material_layout,
             pass,
+            pass_classic,
+            gamma_blend,
+            classic_format,
             hdr_pass,
             reflection_pass,
             corona_bind_group,
@@ -4648,9 +4682,10 @@ impl Renderer {
         }
     }
 
-    fn main_pass(&self, enhanced: bool, reflections: bool) -> &PassPipelines {
+    fn main_pass(&self, enhanced: bool, reflections: bool, encoded: bool) -> &PassPipelines {
         if enhanced { self.hdr_pass.as_ref().unwrap() }
         else if reflections { self.reflection_pass.as_ref().unwrap() }
+        else if encoded { self.pass_classic.as_ref().unwrap() }
         else { &self.pass }
     }
 
@@ -4704,6 +4739,8 @@ impl Renderer {
             return t.clone();
         }
         self.evict_targets();
+        let classic_views = [self.classic_format];
+        let view_formats: &[wgpu::TextureFormat] = if self.gamma_blend { &classic_views } else { &[] };
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("scaled scene"),
             size: wgpu::Extent3d {
@@ -4716,7 +4753,7 @@ impl Renderer {
             dimension: wgpu::TextureDimension::D2,
             format: self.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            view_formats,
         });
         let view = tex.create_view(&Default::default());
         let bg = self.picture_group(&view);
@@ -6806,6 +6843,8 @@ impl Renderer {
             height: h,
             depth_or_array_layers: 1,
         };
+        let classic_views = [self.classic_format];
+        let view_formats: &[wgpu::TextureFormat] = if self.gamma_blend { &classic_views } else { &[] };
         let color = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("msaa colour"),
             size,
@@ -6814,7 +6853,7 @@ impl Renderer {
             dimension: wgpu::TextureDimension::D2,
             format: self.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
+            view_formats,
         });
         let depth = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("msaa depth"),
@@ -8531,7 +8570,11 @@ impl Renderer {
             && scene.glass_slot.is_some()
             && (lighting.rain > 0.001 || lighting.wetness > 0.02)
             && omsi_cfg::env::var_os("OMSI_NO_GLASS_PICTURE").is_none();
-        let scaled = (width, height) != (full_w, full_h) || vanilla_fxaa || (glass_on && !enhanced_view);
+        // Vanilla and Vanilla+ share the OMSI look (encoded shading, gamma blending);
+        // Vanilla+ only adds options (sun shadows, SSAO, detail). Enhanced is separate.
+        let vanilla_look = lighting.classic || !lighting.enhanced;
+        let want_encoded = self.gamma_blend && vanilla_look && with_overlays && !enhanced_view;
+        let scaled = (width, height) != (full_w, full_h) || vanilla_fxaa || (glass_on && !enhanced_view) || want_encoded;
         let scene_target: Option<(wgpu::TextureView, wgpu::BindGroup)> = if scaled {
             Some(self.scale_target(width, height))
         } else {
@@ -8565,6 +8608,14 @@ impl Renderer {
             && omsi_cfg::env::var_os("OMSI_NO_PUDDLE_REFLECTIONS").is_none();
         let reflection_frame = !enhanced && puddles_wanted && self.reflection_pass.is_some();
         let masked_frame = enhanced || reflection_frame;
+        let encoded = want_encoded && !masked_frame;
+        let classic_format = self.classic_format;
+        let unorm_view = |v: &wgpu::TextureView| {
+            v.texture().create_view(&wgpu::TextureViewDescriptor {
+                format: Some(classic_format),
+                ..Default::default()
+            })
+        };
         let grid = self.prepare_lights(scene, cam_rel, enhanced_frame);
         self.prepare_coronas(scene, lighting.night, lighting.inside.as_ref().filter(|v| point_in_vehicle_box(camera.position, v)));
         self.prepare_smoke(scene, camera.position);
@@ -8776,7 +8827,7 @@ impl Renderer {
             sun_color: lighting.sun_color.extend(lighting.night_maps.unwrap_or(lighting.night)).to_array(),
             sky_color: lighting
                 .secondary
-                .extend(if lighting.classic && !enhanced { 1.0 } else { 0.0 })
+                .extend(if vanilla_look && !enhanced { 1.0 } else { 0.0 })
                 .to_array(),
             light_grid: grid,
             sky: [
@@ -8847,6 +8898,17 @@ impl Renderer {
                 lamp_pick.map_or(1.0, |l| l.far),
                 1.0 / self.options.shadow_size as f32,
             ],
+            parts: {
+                let mut parts = [[0.0f32; 4]; 9];
+                for (k, (o, h, bb)) in lighting.puddle_parts.iter().take(3).enumerate() {
+                    let r = (*o - ro).as_vec3();
+                    let h = (*h as f32).to_radians();
+                    parts[k * 3] = [r.x, r.y, r.z, h.sin()];
+                    parts[k * 3 + 1] = [h.cos(), bb[0] * 0.5, bb[1] * 0.5, bb[2] * 0.5];
+                    parts[k * 3 + 2] = [bb[3], bb[4], bb[5], 1.0];
+                }
+                parts
+            },
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cu));
@@ -9351,6 +9413,13 @@ impl Renderer {
             let mut batches: Vec<Batch> = Vec::new();
             for &(i, _, _) in &visible {
                 let inst = &scene.instances[i];
+                // [ROLLBACK ordered-115] a vehicle drawn in model order keeps out of the depth prepass: its
+                // later slots' depth, laid first, rejected what the model draws before them (a knob under
+                // a housing whose alpha layer cuts the panel's depth: nothing was left but the sky). Its
+                // own draws write the depth as they go, as Omsi.exe's do. OMSI_ORDERED_PREPASS=1: as before.
+                if inst.ordered && omsi_cfg::env::var_os("OMSI_ORDERED_PREPASS").is_none() {
+                    continue;
+                }
                 let cull = culls_back_faces(scene, inst);
                 for (ri, (_, _, slot)) in scene.meshes[inst.mesh].ranges.iter().enumerate() {
                     let mat_id = inst.materials.get(*slot as usize).copied().unwrap_or(0);
@@ -9763,8 +9832,8 @@ impl Renderer {
         // has to load the first one's targets back into the GPU's tile memory, which cost
         // more GPU time than it saved on the CPU.)
         let main_bundles = if omsi_cfg::env::var_os("OMSI_NO_BUNDLES").is_none() {
-            let pp = self.main_pass(enhanced, reflection_frame);
-            let format = if masked_frame { HDR_FORMAT } else { self.format };
+            let pp = self.main_pass(enhanced, reflection_frame, encoded);
+            let format = if masked_frame { HDR_FORMAT } else if encoded { self.classic_format } else { self.format };
             record_bundles(
                 &self.device,
                 self.encoding_pool.as_ref(),
@@ -10147,7 +10216,7 @@ impl Renderer {
             // (unscaled - multiplying it by the enhanced exposure blew a night sky's dim clear
             // colour out to white instead) keeps a real gap from ever reading as a rendering
             // bug of its own.
-            let sky = if lighting.classic && !enhanced { lighting.sky_color.map(|v| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }) } else { lighting.sky_color };
+            let sky = if vanilla_look && !enhanced && !encoded { lighting.sky_color.map(|v| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }) } else { lighting.sky_color };
             let msaa_color = targets.as_ref().map(|t| &t.0);
             let depth_view: &wgpu::TextureView = match &targets {
                 Some(t) => &t.1,
@@ -10159,6 +10228,8 @@ impl Renderer {
             } else {
                 None
             };
+            let classic_scene = encoded.then(|| unorm_view(scene_view));
+            let classic_msaa = (encoded && !single).then(|| unorm_view(msaa_color.expect("multisampled target")));
             let (draw_view, resolve_view): (&wgpu::TextureView, Option<&wgpu::TextureView>) =
                 match hdr {
                     Some(h) => match &h.msaa_view {
@@ -10166,14 +10237,15 @@ impl Renderer {
                         None => (&h.view, None),
                     },
                     None => {
+                        let scene_draw = classic_scene.as_ref().unwrap_or(scene_view);
                         if single {
-                            (scene_view, None)
+                            (scene_draw, None)
                         } else {
-                            (msaa_color.expect("multisampled target"), Some(scene_view))
+                            (classic_msaa.as_ref().unwrap_or(msaa_color.expect("multisampled target")), Some(scene_draw))
                         }
                     }
                 };
-            let pp = self.main_pass(enhanced, reflection_frame);
+            let pp = self.main_pass(enhanced, reflection_frame, encoded);
             // the enhanced pass's screen mask beside the picture (see `MASK_FORMAT`)
             let mask_attachment = hdr.map(|h| wgpu::RenderPassColorAttachment {
                 view: h.mask_msaa.as_ref().unwrap_or(&h.mask),
@@ -10387,6 +10459,8 @@ impl Renderer {
         if glass_on {
             let hdr = masked_frame.then(|| &self.hdr_targets[&(width, height)]);
             let view = hdr.map_or(scene_view, |h| h.puddles.as_ref().filter(|_| puddles_on).map_or(&h.view, |p| &p.view));
+            let rain_unorm = encoded.then(|| unorm_view(scene_view));
+            let view = rain_unorm.as_ref().unwrap_or(view);
             let behind = self.glass_picture.as_ref().unwrap();
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo { texture: view.texture(), mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -10411,7 +10485,7 @@ impl Renderer {
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 }),
             ];
-            let pipes = &self.main_pass(enhanced, reflection_frame).rain_pipelines;
+            let pipes = &self.main_pass(enhanced, reflection_frame, encoded).rain_pipelines;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("rain on current scene"),
                 color_attachments: &colours[..if colours[2].is_some() { 4 } else if hdr.is_some() { 2 } else { 1 }],
@@ -11858,6 +11932,7 @@ fn sky_shader_source() -> String {
 /// The light coronas (both paths).
 fn corona_shader_source() -> String {
     [
+        include_str!("colour.wgsl"),
         include_str!("corona.wgsl"),
         include_str!("enhanced_common.wgsl"),
     ]

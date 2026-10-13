@@ -83,6 +83,9 @@ pub struct Lane {
     /// after them is not read (Grundorf's 110 `trucks` rules all say 0).
     pub rule_bus: bool,
     pub rule_trucks: bool,
+    /// [ROLLBACK unsched-93] the path is marked "no unscheduled traffic": no random AI car
+    /// is put on it or drives over it, and no pedestrian is spawned on it.
+    pub no_unsched: bool,
     /// The spline this lane belongs to is editor-only: OMSI's invisible service roads at
     /// the edge of a map, where AI traffic drives with no road drawn under it.
     pub invisible: bool,
@@ -283,7 +286,7 @@ impl LaneBuilder {
     pub fn curve(points: Vec<DVec3>, headings: Vec<f32>, curvature: Vec<f32>, kind: LaneKind, width: f32) -> Lane {
         let dist = cumulative(&points);
         let speed_limit_kmh = if kind == LaneKind::Air { AIR_NO_LIMIT_KMH } else { 50.0 };
-        Lane { key: None, reversed: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new() }
+        Lane { key: None, reversed: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, rule_bus: false, rule_trucks: false, no_unsched: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new() }
     }
 
     /// Lane from bare points: headings from the neighbouring points on both sides (the
@@ -793,6 +796,54 @@ impl Network {
             }
         }
         best
+    }
+
+    /// [ROLLBACK lanes-107] The street lanes running alongside the line through `p` along
+    /// `fwd` (a unit vector) within `within` metres to either side: (lateral offset of the
+    /// lane's middle, positive to the right of `fwd`, its half width). For roads laid out as
+    /// objects, where nothing links a lane to its neighbours and the ground has no asphalt
+    /// beside the path.
+    pub fn lanes_beside(&self, p: DVec3, fwd: DVec2, within: f64) -> Vec<(f32, f32)> {
+        let right = DVec2::new(fwd.y, -fwd.x);
+        let cx = (p.x / GRID_CELL).floor() as i32;
+        let cy = (p.y / GRID_CELL).floor() as i32;
+        let mut out: Vec<(f32, f32)> = Vec::new();
+        let mut seen: Vec<usize> = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for &i in self
+                    .grid
+                    .get(&(cx + dx, cy + dy))
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[])
+                {
+                    if seen.contains(&i) {
+                        continue;
+                    }
+                    seen.push(i);
+                    let o = &self.lanes[i];
+                    if o.kind != LaneKind::Street {
+                        continue;
+                    }
+                    let Some((os, d)) = o.nearest_point(p) else {
+                        continue;
+                    };
+                    if d > within {
+                        continue;
+                    }
+                    let (q, oh) = o.at(os);
+                    let hr = (oh as f64).to_radians();
+                    let along = DVec2::new(hr.sin(), hr.cos());
+                    if along.dot(fwd).abs() < 0.9 {
+                        continue;
+                    }
+                    let lat = (q - p).truncate().dot(right) as f32;
+                    let w = if o.width > 1.0 { o.width } else { 3.0 };
+                    out.push((lat, w * 0.5));
+                }
+            }
+        }
+        out
     }
 
     /// The lanes traffic comes from towards distance `s` of `lane`, walked backwards over
@@ -1761,7 +1812,8 @@ const PLAN_LANES: usize = 10;
 /// the way is bent so that it has no step (half the gap on each side).
 const JOINT_BLEND: f32 = 6.0;
 /// Seconds of signalling before a lane change begins to move sideways.
-const SIGNAL_BEFORE_CHANGE: f32 = 1.2;
+// [ROLLBACK lanechange-108] two seconds (was 1.2) before the car moves over
+const SIGNAL_BEFORE_CHANGE: f32 = 2.0;
 
 /// One AI vehicle moving on the network: where it is along its lanes and which way it is
 /// going. The body that follows this way is `ai_motion::AiBody`.
@@ -1811,6 +1863,11 @@ pub struct AiState {
     pub lateral_target: f32,
     /// The S-curve in progress: (from, to, odometer at its start, its length in m).
     pub lateral_ramp: (f32, f32, f32, f32),
+    /// [ROLLBACK deform-105] A way bent round something, laid out by the traffic planner:
+    /// (odometer, offset) points, every metre or so; the offset between them is straight
+    /// between the points. While the odometer is short of the last point this is the offset
+    /// (the S-curve above holds from there on, and the planner leaves it at 0 to 0).
+    pub lateral_curve: Vec<(f32, f32)>,
     /// A turn the car has taken a turn lane for (1 left, 2 right): the way out of the
     /// junction is chosen to match.
     pub turn_wish: i32,
@@ -1998,7 +2055,7 @@ impl LaneSeq {
 
 impl AiState {
     pub fn new(lane: usize, s: f32, seed: u64) -> AiState {
-        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, yield_time: 0.0, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), turn_wish: 0, signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, accept_gap: 4.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None }
+        AiState { traffic_pool: None, veh_type: 0, lane, s, speed: 0.0, max_speed_kmh: 50.0, accel: 1.2, decel: 3.0, length: 5.0, rng: seed | 1, blinker: 0, braking: false, odometer: 0.0, planned_next: None, ahead: Vec::new(), change_plan: Vec::new(), prev_lane: None, yield_time: 0.0, route: Vec::new(), route_index: 0, change: None, change_cooldown: 5.0, lateral: 0.0, lateral_target: 0.0, lateral_ramp: (0.0, 0.0, 0.0, 1.0), lateral_curve: Vec::new(), turn_wish: 0, signal: 0, signal_time: 0.0, lat_accel: 2.8, desire: 1.0, headway: 1.4, min_gap: 2.0, accept_gap: 4.0, reaction: 0.7, front: 2.5, rear: 2.5, held: false, start_timer: 0.0, acc: 0.0, accel_cap: None }
     }
 
     fn rand(&mut self) -> u64 {
@@ -2135,7 +2192,8 @@ impl AiState {
         let Some(l) = net.lanes.get(self.lane) else { return };
         let Some(t) = net.lanes.get(to) else { return };
         // two to three and a half seconds at the speed the car has now, at least 12 m
-        let duration = (3.5 - self.speed * 0.05).clamp(2.0, 3.5);
+        // ([ROLLBACK lanechange-108] a longer, gentler move: three to four seconds)
+        let duration = (4.0 - self.speed * 0.04).clamp(2.8, 4.0);
         let length = (self.speed * duration).max(12.0);
         // (the same share of a lane that starts beside this one, else the point beside the car)
         let s_to = net.beside_s(self.lane, to, self.s.min(l.length()));
@@ -2204,6 +2262,8 @@ impl AiState {
         if let Some(c) = self.change.as_mut() {
             c.length = 8.0;
             c.bypass = true;
+            // (pulling out round something: the old signal time)
+            c.wait = c.wait.min(1.2);
         }
     }
 
@@ -2325,6 +2385,19 @@ impl AiState {
 
     /// The sideways offset of the way when the odometer reads `x`.
     fn lateral_at(&self, x: f32) -> f32 {
+        // [ROLLBACK deform-105] a bent way laid out point by point
+        if let Some(&(x_last, _)) = self.lateral_curve.last() {
+            if x < x_last {
+                let c = &self.lateral_curve;
+                let k = c.partition_point(|p| p.0 <= x);
+                if k == 0 {
+                    return c[0].1;
+                }
+                let (a, b) = (c[k - 1], c[k]);
+                let t = (x - a.0) / (b.0 - a.0).max(1e-3);
+                return a.1 + (b.1 - a.1) * t;
+            }
+        }
         let (from, to, x0, len) = self.lateral_ramp;
         from + (to - from) * smooth01((x - x0) / len.max(0.1))
     }
@@ -2479,7 +2552,14 @@ impl AiState {
                 self.held = true;
                 acc = acc.min(0.0);
             } else if self.held {
-                self.start_timer -= dt;
+                // [ROLLBACK queuestart-100] the cars of a queue do not wait for the one ahead to
+                // be gone: once it rolls, the reaction runs out three times as fast (the wave
+                // down the queue at a green light), but for the slow drivers (the longest
+                // reactions, about one in five) who keep waiting as before
+                let rolling = lead.map(|l| l.speed > 0.5).unwrap_or(false);
+                let quick = rolling && self.reaction < 1.05;
+                let k = if quick { 3.0 } else { 1.0 };
+                self.start_timer -= k * dt;
                 if self.start_timer > 0.0 {
                     acc = 0.0;
                 } else {
@@ -2542,6 +2622,10 @@ impl AiState {
         }
         // bay offset: a new target starts an S-curve from where the car is now, eight metres
         // long for every metre sideways (at least 8, at most 30)
+        let curve_end = self.lateral_curve.last().map(|l| l.0);
+        if curve_end.is_some_and(|x| self.odometer >= x) {
+            self.lateral_curve.clear();
+        }
         if (self.lateral_target - self.lateral_ramp.1).abs() > 1e-3 {
             let from = self.lateral_at(self.odometer - ds);
             let len = ((self.lateral_target - from).abs() * 8.0).clamp(8.0, 30.0);

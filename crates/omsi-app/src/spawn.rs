@@ -447,6 +447,7 @@ pub(crate) fn spawn_player(
         mirror_dev: Vec::new(),
         mirror_dev_dirty: std::sync::atomic::AtomicBool::new(false),
         foot_mix: None,
+        listener_section: None,
         take_change: false,
         toggled_up: Default::default(),
         momentary_gears: crate::settings::Settings::load().momentary_gears,

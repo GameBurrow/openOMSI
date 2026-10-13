@@ -554,11 +554,13 @@ fn start_sheet(l: &mut Launcher, r: Rect) -> bool {
     let mut y = inner.y;
     if let Some(m) = l.state.map().cloned() {
         let mut labels = vec![if l.state.choice.free { "Automatic (the map's first)".to_string() } else { "Automatic (nearest to the first stop)".to_string() }];
-        labels.extend(m.entry_points.iter().map(|e| if e.name.is_empty() { format!("entry {}", e.index + 1) } else { e.name.clone() }));
-        let mut es = if l.state.choice.entry < 0 { 0 } else { (l.state.choice.entry as usize + 1).min(labels.len().saturating_sub(1)) };
+        // [ROLLBACK entries-120] alphabetical, the choice staying the place in `global.cfg`'s list
+        let order = super::drive::entry_order(&m);
+        labels.extend(order.iter().map(|&i| super::drive::entry_label(&m.entry_points[i])));
+        let mut es = if l.state.choice.entry < 0 { 0 } else { order.iter().position(|&i| i as i32 == l.state.choice.entry).map_or(0, |p| p + 1) };
         l.ui.label(Rect::new(inner.x, y, 112.0, ROW), "Start at");
         if labels.len() > 1 && l.ui.select("ps-start-at", Rect::new(inner.x + 112.0, y, inner.w - 112.0, ROW), &mut es, &labels) {
-            l.state.choice.entry = es as i32 - 1;
+            l.state.choice.entry = if es == 0 { -1 } else { order[es - 1] as i32 };
             l.state.touched();
         }
         y += ROW + 14.0;
@@ -594,21 +596,9 @@ fn start_sheet(l: &mut Launcher, r: Rect) -> bool {
     }
     y += ROW + 14.0;
 
-    let mut traffic = l.state.choice.traffic;
-    if l.ui.slider("ps-traffic", Rect::new(inner.x, y, inner.w, 36.0), &mut traffic, 0.0, 120.0, 1.0, "Cars around", &|v| format!("{v:.0}")) {
-        l.state.choice.traffic = traffic;
-        l.state.touched();
-    }
-    y += 44.0;
-
-    let half = (inner.w - 12.0) * 0.5;
-    let mut passengers = l.state.choice.passengers;
-    if l.ui.toggle("ps-passengers", Rect::new(inner.x, y, half, 34.0), &mut passengers, "Passengers") {
-        l.state.choice.passengers = passengers;
-        l.state.touched();
-    }
+    // [ROLLBACK gameplay-99] (the cars around and the passengers are in the settings' Gameplay tab)
     let mut schedule = l.state.choice.schedule;
-    if l.ui.toggle("ps-schedule", Rect::new(inner.x + half + 12.0, y, half, 34.0), &mut schedule, "Timetable buses") {
+    if l.ui.toggle("ps-schedule", Rect::new(inner.x, y, inner.w, 34.0), &mut schedule, "Timetable buses") {
         l.state.choice.schedule = schedule;
         l.state.touched();
     }
@@ -755,7 +745,7 @@ fn servers_sheet(l: &mut Launcher, r: Rect) -> bool {
 
 fn duty_sheet(l: &mut Launcher, r: Rect) -> bool {
     let q = l.phone.filter.to_lowercase();
-    let lines: Vec<(String, String, usize)> = l.state.lines.iter().filter(|x| x.user_allowed).filter(|x| matches(&q, &format!("{} {}", x.name, x.termini.join(" ")))).map(|x| (x.name.clone(), x.termini.join(" – "), x.tours.len())).collect();
+    let lines: Vec<(String, String, usize)> = l.state.lines.iter().filter(|x| x.user_allowed).filter(|x| matches(&q, &format!("{} {}", x.name, x.termini.join(" ")))).map(|x| (x.name.clone(), x.termini.join(" – "), x.tours.iter().filter(|t| t.runs).count())).collect(); /* [ROLLBACK tours-93] */
     let free = l.state.choice.free || l.state.choice.line.is_none();
     let chosen = l.state.choice.line.clone();
     let loading = l.state.loading_lines;
@@ -801,7 +791,7 @@ fn tour_sheet(l: &mut Launcher, r: Rect) -> bool {
         l.ui.text_in("Choose a line first.", Rect::new(r.x + 16.0, r.y, r.w, 40.0), 14.0, Weight::Regular, TEXT_DIM, Align::Left);
         return false;
     };
-    let mut tours: Vec<&omsi_launcher_lib::TourInfo> = line.tours.iter().collect();
+    let mut tours: Vec<&omsi_launcher_lib::TourInfo> = line.tours.iter().filter(|t| t.runs).collect(); /* [ROLLBACK tours-93] */
     tours.sort_by(|a, b| b.runs.cmp(&a.runs).then_with(|| super::drive::natural(&a.number).cmp(&super::drive::natural(&b.number))));
     let items: Vec<(String, String, bool, Option<String>)> = tours
         .iter()

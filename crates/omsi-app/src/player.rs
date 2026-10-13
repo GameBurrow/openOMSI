@@ -195,6 +195,9 @@ pub(crate) struct Player {
     /// With the walker's view: how far in the bus the camera is (0 outside .. 1 inside), set
     /// before each tick; the sound crossfades between the street and the cab by it.
     pub(crate) foot_mix: Option<f32>,
+    /// [ROLLBACK intsep-122] The section of the bus the camera is in (0 the front one), set by the
+    /// app each frame; read for `[int_sounds_separate]`.
+    pub(crate) listener_section: Option<usize>,
     pub(crate) take_change: bool,
     /// Keys whose `_toggle` this bus does as `_up`/`_down` (see `action`): turned up last.
     pub(crate) toggled_up: hashbrown::HashSet<String>,
@@ -1621,6 +1624,10 @@ impl Player {
             // samples outside, the rain on the roof in the cab)
             ss.set_inside_faded(inside, dt, self.foot_mix);
             ss.set_muffled(inside);
+            // [ROLLBACK intsep-122] `[int_sounds_separate]` in the bus or any of its sections
+            let separate = v.ty.def.int_sounds_separate
+                || v.trailers.iter().any(|t| t.ty.def.int_sounds_separate);
+            ss.set_listener_section(if inside { self.listener_section } else { None }, separate);
             ss.set_listener_vehicle(listener_follows_bus);
             // how open the bus is to the outside (doors, driver's window) for every outside
             // sound heard in it - this bus's own and the traffic's: Omsi.exe reads the

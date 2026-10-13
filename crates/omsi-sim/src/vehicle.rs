@@ -948,6 +948,9 @@ pub struct VehicleInstance {
     pub contact: Option<std::sync::Arc<dyn crate::rigid::Ground>>,
     /// Vehicles coupled behind this one.
     pub trailers: Vec<TrailerPart>,
+    /// [ROLLBACK payload-121] The passengers carried by each section (the front one first): their mass (kg) and
+    /// the centre of it in that section's own model frame. Empty: nobody (see `set_payload`).
+    pub payload: Vec<(f32, Vec3)>,
     /// The vehicle's `[smoke]` particle systems (see `crate::particles`).
     pub particles: ParticleSet,
     /// How far each `[light_enh_2]` of the model (in order) has come on: its fading variable
@@ -1018,6 +1021,10 @@ pub struct VehicleInstance {
     /// (`AI_Engine` 0), the lights are out and, in the dark, only the side lights burn.
     pub ai_parked: bool,
     ai_sidelit: bool,
+    /// [ROLLBACK aispot-83] The vehicle is driven by the AI (`update_ai` has run), and how far
+    /// (m) the headlamp it is given when it has none of its own reaches: 50 .. 65, drawn once.
+    pub ai_driven: bool,
+    pub ai_spot_range: f32,
     var_index: HashMap<String, omsi_script::VarId>,
     /// Where each mesh's material properties come from, resolved against `var_index`
     /// (rebuilt when the vehicle gains engine variables).
@@ -1272,6 +1279,7 @@ impl VehicleInstance {
             html_textures,
             ground: None,
             trailers: Vec::new(),
+            payload: Vec::new(),
             skin_rest: Vec::new(),
             collision: None,
             dynamic_boxes: Vec::new(),
@@ -1293,6 +1301,8 @@ impl VehicleInstance {
             ai_visuals: true,
             ai_parked: false,
             ai_sidelit: false,
+            ai_driven: false,
+            ai_spot_range: 60.0,
             ai_visuals_missed: 0.0,
             var_index,
             props_plan: PropsPlan::default(),
@@ -1719,8 +1729,10 @@ impl VehicleInstance {
         };
         self.trailers
             .iter()
-            .map(|t| {
+            .enumerate()
+            .map(|(k, t)| {
                 let dir = dir_of(t);
+                let carried = self.payload.get(k + 1).map_or(0.0, |p| p.0);
                 let def = &t.ty.def;
                 let driven: Vec<usize> = def
                     .axles
@@ -1738,7 +1750,8 @@ impl VehicleInstance {
                     } else {
                         def.mass
                     }
-                    .max(0.0),
+                    .max(0.0)
+                        + carried,
                     driven_wheels: driven.len() * 2,
                     radius: driven
                         .first()
@@ -1751,10 +1764,25 @@ impl VehicleInstance {
                         .map(|&id| self.get(id).max(0.0))
                         .sum::<f32>()
                         + def.rolling_resistance.max(0.0),
-                    load: (0..def.axles.len()).map(wheel_load).sum(),
+                    load: (0..def.axles.len()).map(wheel_load).sum::<f32>() + carried * 9.81,
                 }
             })
             .collect()
+    }
+
+    /// [ROLLBACK payload-121] Passengers aboard: per section (the front one first) their mass (kg) and the
+    /// centre of it in the section's model frame.
+    pub fn set_payload(&mut self, payload: Vec<(f32, Vec3)>) {
+        self.payload = payload;
+    }
+
+    /// [ROLLBACK payload-121] The weight of the vehicle itself (all its sections, kg) and of the passengers
+    /// aboard.
+    pub fn weights_kg(&self) -> (f32, f32) {
+        let own = |m: f32| if m < 100.0 { m * 1000.0 } else { m };
+        let behind: f32 = self.trailers.iter().map(|t| own(t.ty.def.mass)).sum();
+        let dry = own(self.ty.def.mass) + behind;
+        (dry, self.payload.iter().map(|p| p.0).sum())
     }
 
     fn step_rigid(&mut self, dt: f32, m_wheel: f32, brakes: &[f32], steer: f32) {
@@ -1763,6 +1791,9 @@ impl VehicleInstance {
             w.spring_factor = self.spring_factor(i / 2, i % 2);
         }
         rb.coupled = self.coupled_parts();
+        // [ROLLBACK payload-121] the passengers of the front section weigh on its body
+        let (kg, at) = self.payload.first().copied().unwrap_or((0.0, Vec3::ZERO));
+        rb.set_payload(kg, at);
         {
             let ground = self.ground.clone();
             let flat = |_: f64, _: f64, _: f64| crate::rigid::GroundProbe {
@@ -2471,6 +2502,13 @@ impl VehicleInstance {
                 _ => 0.0,
             },
         };
+        if !self.ai_driven {
+            self.ai_driven = true;
+            // (a range of 50 to 65 m of its own, kept for good: the vehicle's place in memory
+            // is the draw, as for the odometer's start)
+            let seed = (std::ptr::addr_of!(self.host) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40;
+            self.ai_spot_range = 50.0 + (seed % 16) as f32;
+        }
         for (name, v) in [
             ("AI", 1.0),
             ("AI_Blinker_L", matches!(ai.blinker, 1 | 3) as i32 as f32),

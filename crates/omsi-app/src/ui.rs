@@ -599,6 +599,9 @@ pub struct Ui {
     /// Where the controls of the settings rows were drawn (a slider's track, a stepper), one
     /// entry per line in `menu_rects`: a click there sets the value.
     pub menu_ctl: Vec<Option<[f32; 4]>>,
+    /// [ROLLBACK walkmenus-125] The buttons of the rows that hold a group of them (kind `g`):
+    /// the line's index in `menu_rects` and where each button was drawn, left to right.
+    pub menu_btns: Vec<(usize, Vec<[f32; 4]>)>,
     /// The sidebar of a settings window: one box per page, the way back last.
     pub menu_side: Vec<[f32; 4]>,
     /// The rows of the timetable beside a line's tours (the stops to start from), the stop the
@@ -706,6 +709,7 @@ impl Ui {
             .chain(self.menu_form_buttons.iter_mut())
             .chain(self.dd_rects.iter_mut())
             .chain(self.menu_ctl.iter_mut().flatten())
+            .chain(self.menu_btns.iter_mut().flat_map(|b| b.1.iter_mut()))
             .chain(self.menu_scroll_thumb.iter_mut())
             .chain(self.menu_scroll_track.iter_mut())
             .chain(self.menu_pane_go.iter_mut())
@@ -743,7 +747,7 @@ impl Ui {
         self.chat.rect[2] += x;
     }
     pub fn new() -> Option<Ui> {
-        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), menu_form_fields: Vec::new(), menu_form_buttons: Vec::new(), edit_hits: Vec::new(), edit_panel: None, anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default(), info_rect: None, marks_img: None, marks_buf: Vec::new() })
+        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), menu_btns: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), menu_form_fields: Vec::new(), menu_form_buttons: Vec::new(), edit_hits: Vec::new(), edit_panel: None, anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default(), info_rect: None, marks_img: None, marks_buf: Vec::new() })
     }
 
     /// Draw the frame's interface: its overlays go after the HUD's in `scene.overlays`.
@@ -1167,13 +1171,24 @@ impl TextCache {
 
     /// A plate of one colour: 0 the chat's dark translucent input box, 1 the loading
     /// screen's bar track, 2 its fill, 3 .. 7 as said below.
+    /// [ROLLBACK glass-128] A panel colour as see-through as the Alt menu's (84 %), thinner or
+    /// thicker with the opacity setting.
+    fn glass(&self, c: [u8; 4]) -> [u8; 4] {
+        [
+            c[0],
+            c[1],
+            c[2],
+            (214.0 * self.backdrop).round().clamp(0.0, 255.0) as u8,
+        ]
+    }
+
     fn plate(&mut self, r: &Renderer, scene: &mut Scene, kind: u8) -> TextureId {
         let mut rgba = match kind {
             1 => vec![255, 255, 255, 38],
             2 => vec![235, 238, 242, 255],
             // an opaque panel as designed (translucent dark panels show the sky through
             // them), unless the opacity setting asks for less
-            3 => vec![22, 22, 22, 255],
+            3 => vec![22, 22, 22, 214],
             // the chosen line: the interface's accent
             4 => vec![232, 160, 48, 255],
             // a line the mouse is over, the next stop
@@ -1701,6 +1716,7 @@ impl Ui {
     fn draw_menu(&mut self, r: &Renderer, scene: &mut Scene, f: &Frame) {
         self.menu_rects.clear();
         self.menu_ctl.clear();
+        self.menu_btns.clear();
         self.menu_side.clear();
         self.menu_pane.clear();
         self.menu_pane_start = 0;
@@ -1807,7 +1823,8 @@ impl Ui {
         // the card: a soft shadow, a 1 px hairline round it, the flat panel
         self.text.shadow(r, scene, [x, y, x + w, y + h], radius, 28.0 * s, 10.0 * s, 110);
         self.text.rounded(r, scene, [x - 1.0, y - 1.0, x + w + 1.0, y + h + 1.0], radius + 1.0, BORDER);
-        self.text.rounded(r, scene, [x, y, x + w, y + h], radius, PANEL);
+        let glass = self.text.glass(PANEL);
+        self.text.rounded(r, scene, [x, y, x + w, y + h], radius, glass);
         // the header: what the list is of (or the game's name), and the title
         let (title, sub): (String, String) = match f.menu_head.as_ref() {
             Some((t, u)) => (t.clone(), u.clone()),
@@ -2003,7 +2020,8 @@ impl Ui {
             let (px0, py0) = (list_r + 4.0 * s, y + header_h);
             let (px1, py1) = (x + w - pad, y + h - pad);
             self.text.rounded(r, scene, [px0 - 1.0, py0 - 1.0, px1 + 1.0, py1 + 1.0], CARD_R * s + 1.0, BORDER);
-            self.text.rounded(r, scene, [px0, py0, px1, py1], CARD_R * s, PANEL_ALT);
+            let glass = self.text.glass(PANEL_ALT);
+            self.text.rounded(r, scene, [px0, py0, px1, py1], CARD_R * s, glass);
             let pad = tin;
             let inner = px1 - px0 - pad * 2.0;
             let mut cy = py0 + 28.0 * s;
@@ -2138,7 +2156,8 @@ impl Ui {
             let (px0, py0) = (list_r + 4.0 * s, y + header_h);
             let (px1, py1) = (x + w - pad, y + h - pad);
             self.text.rounded(r, scene, [px0 - 1.0, py0 - 1.0, px1 + 1.0, py1 + 1.0], CARD_R * s + 1.0, BORDER);
-            self.text.rounded(r, scene, [px0, py0, px1, py1], CARD_R * s, PANEL_ALT);
+            let glass = self.text.glass(PANEL_ALT);
+            self.text.rounded(r, scene, [px0, py0, px1, py1], CARD_R * s, glass);
             let ipad = tin;
             let inner = px1 - px0 - ipad * 2.0;
             let mut top = py0 + 18.0 * s;
@@ -2206,10 +2225,33 @@ impl Ui {
         let header_h = 72.0 * s;
         let pad = PAD * s;
         let tin = TEXT_IN * s;
-        let fixed_h = (if f.vr { 440.0 } else { 600.0 }) * s;
-        let h = fixed_h.min(f.height * (if f.vr { 0.70 } else { 0.94 })).max(220.0 * s);
+        // [ROLLBACK walkmenus-125] a page whose rows have no second line (the time, the weather)
+        // gets lower rows and a taller window: more of it in view, no scrolling
+        let compact = !f.vr
+            && !items.is_empty()
+            && items
+                .iter()
+                .all(|(_, l)| l.split('\u{1f}').nth(3).map_or(true, str::is_empty));
+        let fixed_h = (if f.vr {
+            440.0
+        } else if compact {
+            660.0
+        } else {
+            600.0
+        }) * s;
+        let h = fixed_h
+            .min(f.height * (if f.vr { 0.70 } else { 0.94 }))
+            .max(220.0 * s);
         let room = h - header_h - pad;
-        let row_h = ((if f.vr { 54.0 } else { 62.0 }) * s).min(room).max(30.0 * s);
+        let row_h = ((if f.vr {
+            54.0
+        } else if compact {
+            42.0
+        } else {
+            62.0
+        }) * s)
+            .min(room)
+            .max(30.0 * s);
         let rows = ((room / row_h).floor() as usize).clamp(1, items.len().max(1));
         let start = match (items.len() > rows, f.menu_top) {
             (false, _) => 0,
@@ -2224,7 +2266,8 @@ impl Ui {
         let radius = CARD_R * s;
         self.text.shadow(r, scene, [x, y, x + w, y + h], radius, 28.0 * s, 10.0 * s, 110);
         self.text.rounded(r, scene, [x - 1.0, y - 1.0, x + w + 1.0, y + h + 1.0], radius + 1.0, BORDER);
-        self.text.rounded(r, scene, [x, y, x + w, y + h], radius, PANEL);
+        let glass = self.text.glass(PANEL);
+        self.text.rounded(r, scene, [x, y, x + w, y + h], radius, glass);
         // the header: the game's name small, the title large
         let (title, sub): (String, String) = match f.menu_head.as_ref() {
             Some((t, u)) => (t.clone(), u.clone()),
@@ -2236,7 +2279,8 @@ impl Ui {
         if side_w > 0.0 {
             let (sx0, sx1) = (x + pad, x + side_w);
             self.text.rounded(r, scene, [sx0 - 1.0, y + header_h - 1.0, sx1 + 1.0, y + h - pad + 1.0], CARD_R * s + 1.0, BORDER);
-            self.text.rounded(r, scene, [sx0, y + header_h, sx1, y + h - pad], CARD_R * s, PANEL_ALT);
+            let glass = self.text.glass(PANEL_ALT);
+            self.text.rounded(r, scene, [sx0, y + header_h, sx1, y + h - pad], CARD_R * s, glass);
             let inset = 6.0 * s;
             let bottom = y + h - pad - inset;
             let pages_top = y + header_h + inset;
@@ -2387,7 +2431,77 @@ impl Ui {
                     rx - cw
                 }
                 // a value being typed: lit in the accent
-                "E" => self.chip(r, scene, value, (13.0 * s) as u32, AMBER, ACCENT_SOFT, false, rx, cy, s),
+                "E" => self.chip(
+                    r,
+                    scene,
+                    value,
+                    (13.0 * s) as u32,
+                    AMBER,
+                    ACCENT_SOFT,
+                    false,
+                    rx,
+                    cy,
+                    s,
+                ),
+                // [ROLLBACK walkmenus-125] a value shown large, a box to click and type in (`U`: being typed)
+                "T" | "U" => {
+                    let (ink, fill) = if kind == "U" {
+                        (AMBER, ACCENT_SOFT)
+                    } else {
+                        (mix(SOFT, AMBER, a), mix(CHIP, ACCENT_SOFT, a))
+                    };
+                    let text = format!("  {value}  ");
+                    self.chip(
+                        r,
+                        scene,
+                        &text,
+                        (22.0 * s) as u32,
+                        ink,
+                        fill,
+                        false,
+                        rx,
+                        cy,
+                        s,
+                    )
+                }
+                // [ROLLBACK walkmenus-125] a group of buttons side by side (the labels apart by \u{1e},
+                // one led by `*` is lit)
+                "g" => {
+                    let mut edge = rx;
+                    let mut rects: Vec<[f32; 4]> = Vec::new();
+                    for lab in value.split('\u{1e}').rev() {
+                        let (lit_btn, lab) = match lab.strip_prefix('*') {
+                            Some(l) => (true, l),
+                            None => (false, lab),
+                        };
+                        let text = format!(" {lab} ");
+                        let w = self.text.width(&text, 13.0 * s) + 18.0 * s;
+                        let hit = [edge - w, rect[1] + 2.0 * s, edge, rect[3] - 2.0 * s];
+                        let hov = over(hit);
+                        let (ink, fill) = if lit_btn || hov {
+                            (AMBER, ACCENT_SOFT)
+                        } else {
+                            (SOFT, CHIP)
+                        };
+                        let l = self.chip(
+                            r,
+                            scene,
+                            &text,
+                            (13.0 * s) as u32,
+                            ink,
+                            fill,
+                            false,
+                            edge,
+                            cy,
+                            s,
+                        );
+                        rects.push([l, hit[1], edge, hit[3]]);
+                        edge = l - 6.0 * s;
+                    }
+                    rects.reverse();
+                    self.menu_btns.push((self.menu_rects.len(), rects));
+                    edge + 6.0 * s
+                }
                 // a button
                 _ => {
                     if value.is_empty() {

@@ -140,6 +140,32 @@ impl KeyboardCfg {
         if !self.game.iter().any(|b| b.action.eq_ignore_ascii_case("view_toggle_interior")) {
             self.game.push(KeyBinding { action: "view_toggle_interior".into(), scan_code: 0, modifier: 0 });
         }
+        // [ROLLBACK zoomkeys-122] zooming the view with the keyboard: on the list, unassigned
+        for action in ["view_zoom_in", "view_zoom_out"] {
+            if !self
+                .game
+                .iter()
+                .any(|b| b.action.eq_ignore_ascii_case(action))
+            {
+                self.game.push(KeyBinding {
+                    action: action.into(),
+                    scan_code: 0,
+                    modifier: 0,
+                });
+            }
+        }
+        // [ROLLBACK walkmenus-125] getting up from the driver's seat: Ctrl+Shift+G unless moved
+        if !self
+            .game
+            .iter()
+            .any(|b| b.action.eq_ignore_ascii_case("walk_getup"))
+        {
+            self.game.push(KeyBinding {
+                action: "walk_getup".into(),
+                scan_code: 34,
+                modifier: KEY_SHIFT | KEY_CTRL,
+            });
+        }
         self
     }
 

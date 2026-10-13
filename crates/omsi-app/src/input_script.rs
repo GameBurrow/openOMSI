@@ -1966,6 +1966,11 @@ impl App {
             KeyCode::Digit7 | KeyCode::Numpad7 => Some('7'),
             KeyCode::Digit8 | KeyCode::Numpad8 => Some('8'),
             KeyCode::Digit9 | KeyCode::Numpad9 => Some('9'),
+            // [ROLLBACK walkmenus-125] a colon splits hours, minutes and seconds (Shift+; or . or , -
+            // whatever the layout puts it on)
+            KeyCode::Semicolon | KeyCode::Period | KeyCode::Comma | KeyCode::NumpadDecimal => {
+                Some(':')
+            }
             _ => None,
         };
         match code {
@@ -1981,7 +1986,10 @@ impl App {
             }
             _ => {
                 if let (Some(c), Some(d)) = (digit, self.menu_edit.as_mut()) {
-                    if d.len() < 6 {
+                    let colons = d.matches(':').count();
+                    if d.len() < 8
+                        && (c != ':' || (colons < 2 && !d.is_empty() && !d.ends_with(':')))
+                    {
                         d.push(c);
                     }
                 }
@@ -2114,14 +2122,25 @@ impl App {
 
     /// Set the clock to the time typed (digits: hh, hhmm or hhmmss; what is missing is 0).
     pub(crate) fn apply_time_edit(&mut self) {
-        let Some(d) = self.menu_edit.take() else { return };
+        let Some(d) = self.menu_edit.take() else {
+            return;
+        };
         if !d.is_empty() {
-            let mut c = d.clone();
-            while c.len() < 6 {
-                c.push('0');
-            }
-            let n = |a: usize| c[a..a + 2].parse::<i64>().unwrap_or(0);
-            let (h, m, sec) = (n(0), n(2), n(4));
+            // [ROLLBACK walkmenus-125] "12" is 12:00:00, "12:30" 12:30:00, "9:05:07" itself; without
+            // colons by the digits: 930 is 9:30, 1230 is 12:30, 123045 is 12:30:45
+            let (h, m, sec) = if d.contains(':') {
+                let mut p = d.split(':').map(|x| x.parse::<i64>().unwrap_or(0));
+                (p.next().unwrap_or(0), p.next().unwrap_or(0), p.next().unwrap_or(0))
+            } else {
+                let n = |a: usize, b: usize| d.get(a..b.min(d.len())).filter(|x| !x.is_empty()).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+                match d.len() {
+                    0..=2 => (n(0, 2), 0, 0),
+                    3 => (n(0, 1), n(1, 3), 0),
+                    4 => (n(0, 2), n(2, 4), 0),
+                    5 => (n(0, 1), n(1, 3), n(3, 5)),
+                    _ => (n(0, 2), n(2, 4), n(4, 6)),
+                }
+            };
             if h > 23 || m > 59 || sec > 59 {
                 self.service_msg = Some((format!("{:02}:{:02}:{:02} is no time of day", h, m, sec), 3.0));
             } else if self.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client) {
@@ -2270,6 +2289,16 @@ impl App {
             let last = self.admin_list.as_ref().map(|l| l.len().saturating_sub(1)).unwrap_or(0);
             self.chooser = Some(k.min(last));
         }
+    }
+
+    /// [ROLLBACK walkmenus-125] A click on button `j` of the group in line `k` of a list: the
+    /// line's action run with the button's number after it.
+    pub(crate) fn group_click(&mut self, k: usize, j: usize) {
+        let Some(l) = self.admin_list.as_mut().and_then(|l| l.get_mut(k)) else {
+            return;
+        };
+        l.1 = format!("{} {j}", l.1.split(' ').next().unwrap_or(""));
+        self.chooser_pick(k);
     }
 
     /// A click on the control of line `k` (a slider's track, a stepper), `fx` of the way
@@ -3036,6 +3065,15 @@ impl App {
                 self.close_game_menu();
                 self.back_to_bus();
             }
+            // [ROLLBACK walkmenus-125]
+            "viewedit" => {
+                self.close_game_menu();
+                self.view_editor_open();
+            }
+            "clearai" => {
+                self.close_game_menu();
+                crate::admin::clear_ai_traffic(self);
+            }
             "load" => {
                 self.game_menu = None;
                 if self.load_quicksave() {
@@ -3174,10 +3212,9 @@ impl App {
             "metar_once" => self.load_metar_once(),
             "metar_refresh" => self.refresh_metar_now(),
             "weather_custom" => self.current_weather_as_custom(),
-            "switch" => {
-                self.close_game_menu();
-                self.switch_vehicle();
-            }
+            // [ROLLBACK takeover-122] was: the next vehicle at once. A list of the vehicles standing in
+            // the world to choose from
+            "switch" => self.open_list(crate::game_lists::ListKind::Takeover),
             "later" | "earlier" | "later10" | "earlier10" => {
                 self.close_game_menu();
                 if self.lan.as_ref().map(|l| l.role == omsi_net::Role::Client).unwrap_or(false) {
@@ -3509,6 +3546,31 @@ impl App {
     }
 
     /// Move the clock by `secs` (the traffic's clock with it), as OMSI's time dialog does.
+    /// [ROLLBACK walkmenus-125] When the sun comes up and goes down today at the map's place (seconds
+    /// of the day, to 5 minutes), by the same sun the sky is drawn with. None in a polar day or night.
+    pub(crate) fn sun_times(&self) -> Option<(f64, f64)> {
+        let place = omsi_sim::daylight::place();
+        let mut c = self.clock.clone();
+        let (mut rise, mut set) = (None, None);
+        let mut last = {
+            c.time = 0.0;
+            omsi_sim::daylight::sun_position(&c, &place).0
+        };
+        for m in 1..=1440 {
+            c.time = m as f64 * 60.0;
+            let alt = omsi_sim::daylight::sun_position(&c, &place).0;
+            if last < 0.0 && alt >= 0.0 && rise.is_none() {
+                rise = Some(c.time);
+            }
+            if last >= 0.0 && alt < 0.0 {
+                set = Some(c.time);
+            }
+            last = alt;
+        }
+        let round = |t: f64| ((t / 300.0).round() * 300.0).clamp(0.0, 86100.0);
+        Some((round(rise?), round(set?)))
+    }
+
     pub(crate) fn shift_clock(&mut self, secs: f64) {
         if self.real_time_locked() {
             self.service_msg = Some(("The time cannot be changed while the real-time sync is on".into(), 3.0));
@@ -4618,14 +4680,11 @@ pub(crate) fn parse_input_script() -> Vec<(f32, String)> {
 
 /// The game menu on a server (`--lan-join https://…`): the world's clock and weather are the
 /// server's, and the way out leaves the server.
-pub(crate) const SERVER_GAME_MENU: [(&str, &str); 8] = [
+pub(crate) const SERVER_GAME_MENU: [(&str, &str); 5] = [
     ("resume", "Resume"),
     ("options", "Options..."),
-    ("camera", "Camera..."),
     ("vehicle", "Vehicle options..."),
-    ("world", "World options..."),
     ("map", "City map"),
-    ("shot", "Screenshot"),
     ("quit", "Leave the server"),
 ];
 
@@ -4653,10 +4712,10 @@ impl crate::App {
         if self.on_foot.is_some() && self.player.is_some() {
             v.insert(at, ("tobus", "Back to my bus"));
             at += 1;
-        }
-        // without a bus of one's own: no line to drive
-        if self.player.is_none() {
-            v.retain(|x| x.0 != "duty");
+        } else if self.player.is_some() && self.on_foot.is_none() {
+            // [ROLLBACK walkmenus-125] the other half of "Back to my bus"
+            v.insert(at, ("getout", "Walk out"));
+            at += 1;
         }
         // ending the route is offered only while there is one, skipping a stop while its
         // trip still has one to come
@@ -4666,13 +4725,37 @@ impl crate::App {
         if !self.duty.as_ref().is_some_and(|d| d.stop_to_skip()) {
             v.retain(|x| x.0 != "skipstop");
         }
-        if self.navigator.is_none() {
+        // [ROLLBACK walkmenus-125] the city map is a line here only when the HUD has no
+        // navigator tile to open it from (switched off, or the interface hidden)
+        if self
+            .navigator
+            .as_ref()
+            .map_or(true, |n| n.enabled && !self.gui_hidden)
+        {
             v.retain(|x| x.0 != "map");
+        }
+        // [ROLLBACK walkmenus-125] in the cabin: the driver's view and the mirrors a line away
+        if self.player.is_some() && self.on_foot.is_none() && self.view == "driver" {
+            if let Some(c) = v.iter().position(|x| x.0 == "options") {
+                v.insert(c + 1, ("viewedit", "Driver view and mirrors..."));
+                at = at.max(c + 2);
+            }
+        }
+        // [ROLLBACK walkmenus-125] "Clear AI traffic" from the world page, a line up front
+        let client = self
+            .lan
+            .as_ref()
+            .is_some_and(|l| l.role == omsi_net::Role::Client);
+        if self.traffic.is_some() && !client && !on_server(&self.args) {
+            if let Some(q) = v.iter().position(|x| x.0 == "vehicle") {
+                v.insert(q + 1, ("clearai", "Clear AI traffic"));
+                at = at.max(q + 2);
+            }
         }
         let host = self.lan.as_ref().map(|l| l.role == omsi_net::Role::Host).unwrap_or(false);
         // the server code: a line to copy it, right under "World options" (only in a LAN session or on a server)
         if self.lan.is_some() || on_server(&self.args) {
-            if let Some(w) = v.iter().position(|x| x.0 == "world") {
+            if let Some(w) = v.iter().position(|x| x.0 == "vehicle") {
                 v.insert(w + 1, ("copycode", "Copy server code"));
                 at = at.max(w + 2);
             }
@@ -4742,23 +4825,17 @@ pub(crate) const SAVES: &str = "Saves";
 
 /// The lines of the game menu: (what, label). What can be set is on the pages behind
 /// "Options", "Vehicle options" and "World options" (see `game_lists`).
-pub(crate) const GAME_MENU: [(&str, &str); 15] = [
+pub(crate) const GAME_MENU: [(&str, &str); 9] = [
     ("resume", "Resume"),
     ("options", "Options..."),
-    ("controls", "Controls..."),
-    // (the driver's view - seat, field of view, head movement - straight from the pause
-    // menu: it is what is changed most while driving, #908)
-    ("camera", "Camera..."),
     ("vehicle", "Vehicle options..."),
-    ("world", "World options..."),
+    // [ROLLBACK walkmenus-125] the world's options, the line and tour, the slot save and the
+    // screenshot are no lines here: the Alt menu has the first two, the keys the others
     ("map", "City map"),
-    ("duty", "Line and tour..."),
     ("skipstop", "Skip the next stop"),
     ("endduty", "End the tour"),
-    ("save", "Save the situation"),
-    ("saveslot", "Save to a new slot"),
-    ("load", "Load the quicksave"),
-    ("shot", "Screenshot"),
+    ("save", "Quick Save"),
+    ("load", "Quick Load"),
     ("quit", "End the session"),
 ];
 

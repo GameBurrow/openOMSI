@@ -421,6 +421,8 @@ pub struct Schedule {
     lan_tours: HashSet<(String, String)>,
     /// Time of today's timetable at the last tick (s).
     last_tod: f64,
+    /// [ROLLBACK clockjump-93] The traffic's clock at the last frame `note_clock` saw.
+    clock_seen: f64,
     /// The lines the date's chrono folders take off the timetable, with the folder that does
     /// it: why a duty on such a line cannot be driven.
     deactivated: Vec<(String, std::path::PathBuf)>,
@@ -489,6 +491,18 @@ impl Schedule {
     /// `clock` gives the date: tours carry a validity mask (bits 0-6 Monday…Sunday, 7 public
     /// holiday, 8 school holidays, 9 school days) that selects which run today.
     pub fn new(root: &Path, world: &World, clock: &omsi_sim::SimClock) -> Schedule {
+        Schedule::build(root, world, clock, true)
+    }
+
+    /// [ROLLBACK schedlist-123] The timetable for the lists of lines and tours and for the people
+    /// at the stops, in a game that brings no timetable buses: without loading the models of
+    /// every depot vehicle and train of the map (what took tens of seconds on a big map, in the
+    /// frame of the click on the Alt menu's timetable tile).
+    pub fn new_for_lists(root: &Path, world: &World, clock: &omsi_sim::SimClock) -> Schedule {
+        Schedule::build(root, world, clock, false)
+    }
+
+    fn build(root: &Path, world: &World, clock: &omsi_sim::SimClock, vehicles: bool) -> Schedule {
         let chrono_dirs = world.chrono_dirs.read().clone();
         let deactivated = omsi_map::chrono_deactivated_lines(&chrono_dirs);
         let data = TimetableData::load_with_chrono(&world.map_dir, &chrono_dirs, &deactivated);
@@ -599,7 +613,7 @@ impl Schedule {
                 .clone()
                 .ok_or_else(|| "could not be loaded".to_string())
         };
-        {
+        if vehicles {
             let lists = &world.ailists;
             for g in lists.groups.iter().filter(|g| g.is_depot) {
                 let mut vehicles = Vec::new();
@@ -626,7 +640,7 @@ impl Schedule {
         }
         // train groups: [aigroup_2] entries pointing at .zug files
         let mut trains: HashMap<String, Vec<Vec<(Arc<VehicleType>, bool)>>> = HashMap::new();
-        {
+        if vehicles {
             let lists = &world.ailists;
             for g in lists.groups.iter().filter(|g| !g.is_depot) {
                 for v in &g.vehicles {
@@ -733,6 +747,7 @@ impl Schedule {
             purge_player_tour: false,
             lan_tours: HashSet::new(),
             last_tod: 0.0,
+            clock_seen: f64::NAN,
             deactivated,
             served,
             shared_stand: HashMap::new(),
@@ -1761,6 +1776,69 @@ impl Schedule {
         out
     }
 
+    /// [ROLLBACK soon-90] Per bus stop, the names of the stops a bus that leaves it within
+    /// `window` seconds of `now` (time of the day) goes on to: only the trips with a line (not
+    /// the runs to and from the depot) that run today, that stop there, with the player's
+    /// duty among them. The people who appear at a stop wait for these - not for a night line
+    /// twelve hours away or a depot run, which nothing of this stop's would take them on.
+    pub fn soon_targets(&self, now: f64, duty: Option<&PlayerDuty>, window: f64) -> HashMap<i64, HashSet<String>> {
+        let names = self.stop_names();
+        let name_of = |id: i64| names.get(&id).cloned().unwrap_or_else(|| id.to_string());
+        // (a time past midnight reads as the day's early hours too, and the other way round)
+        let soon = |leave: f64| [leave, leave - DAY, leave + DAY].iter().any(|l| *l >= now - 30.0 && *l <= now + window);
+        let mut out: HashMap<i64, HashSet<String>> = HashMap::new();
+        for (&sid, visits) in &self.visits {
+            let here = name_of(sid);
+            for &(ti, k) in visits {
+                let trip = &self.data.trips[ti];
+                if trip.line.trim().is_empty() {
+                    continue;
+                }
+                let stations = trip_stations(trip);
+                for &i in &self.trip_departures[ti] {
+                    if !self.runs(i) {
+                        continue;
+                    }
+                    let d = &self.departures[i];
+                    let tt = &self.times[d.trip][d.profile];
+                    if !tt.stops.get(k).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let Some(leave) = tt.stations.get(k).map(|s| d.time + s.1) else { continue };
+                    if !soon(leave) {
+                        continue;
+                    }
+                    for (m, to) in stations.iter().enumerate().skip(k + 1) {
+                        let to = name_of(*to);
+                        if to != here && tt.stops.get(m).copied().unwrap_or(true) {
+                            out.entry(sid).or_default().insert(to);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(duty) = duty {
+            for trip in duty.trips.iter().skip(duty.trip_index) {
+                if trip.line.trim().is_empty() {
+                    continue;
+                }
+                for (k, s) in trip.stops.iter().enumerate().filter(|(_, s)| s.stops) {
+                    if !soon(s.dep) {
+                        continue;
+                    }
+                    let here = name_of(s.object_id);
+                    for to in trip.stops.iter().skip(k + 1).filter(|x| x.stops) {
+                        let to = name_of(to.object_id);
+                        if to != here {
+                            out.entry(s.object_id).or_default().insert(to);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn stop_names(&self) -> HashMap<i64, String> {
         let mut names = HashMap::new();
         for b in &self.data.bus_stops {
@@ -1771,6 +1849,61 @@ impl Schedule {
 
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// [ROLLBACK clockjump-93] Every frame, with the traffic's clock: true when it has been set
+    /// to another time (more than the frame's run of the clock, `speed` times real time, off).
+    pub fn note_clock(&mut self, day_time: f64, dt: f64, speed: f64) -> bool {
+        let jumped = self.clock_seen.is_finite() && (day_time - self.clock_seen).abs() > 90.0 + dt.max(0.0) * speed.max(1.0) * 5.0;
+        self.clock_seen = day_time;
+        jumped
+    }
+
+    /// [ROLLBACK clockjump-93] The clock was set to another time: the timetable's buses of the
+    /// old time are taken off the road (the player's tour excepted) and every departure may be
+    /// put out again - the next ticks place the buses that are under way at the new time and
+    /// leave the others at their stands.
+    pub fn time_jumped(&mut self, world: &World, traffic: &mut Traffic, renderer: &Renderer, scene: &mut Scene, clock: &omsi_sim::SimClock) {
+        if traffic.is_mirror() {
+            return;
+        }
+        // [ROLLBACK clockjump-95] today's midnight lies where the clock now puts it (a time set
+        // back, or over midnight, left it where it was), and the date's tours are chosen anew
+        self.day_base = traffic.day_time - clock.time;
+        self.date_clock = clock.clone();
+        self.day = 0;
+        self.set_day(clock);
+        let ids: Vec<u64> = self.car_departure.iter().filter(|(_, i)| !self.is_player_tour(**i)).map(|(id, _)| *id).collect();
+        let mut gone = 0;
+        for id in ids {
+            self.car_departure.remove(&id);
+            self.running.retain(|r| r.car != id);
+            if traffic.remove_car(world, renderer, scene, id) {
+                gone += 1;
+            }
+        }
+        let mut n = 0;
+        for i in 0..self.departures.len() {
+            if self.is_player_tour(i) {
+                continue;
+            }
+            if self.departures[i].spawned {
+                self.departures[i].spawned = false;
+                n += 1;
+            }
+        }
+        let keep: Vec<usize> = self.pending.iter().copied().filter(|i| self.is_player_tour(*i)).collect();
+        self.pending = keep.into_iter().collect();
+        let waiting: Vec<usize> = self.waiting.iter().copied().filter(|i| self.is_player_tour(*i)).collect();
+        self.waiting = waiting;
+        let mine: std::collections::HashSet<usize> = self.awaiting.iter().copied().filter(|i| self.is_player_tour(*i)).collect();
+        self.awaiting = mine;
+        self.later_layover.clear();
+        self.startup.clear();
+        self.retry_at.clear();
+        self.boards_made = f64::NEG_INFINITY;
+        self.last_retry = f64::NEG_INFINITY;
+        log::info!("timetable: the clock was set to another time: {gone} buses taken off the road, {n} departures made ready to run again");
     }
 
     /// Spawn buses whose departure time has come (or passed within `window` seconds), and
@@ -1816,6 +1949,11 @@ impl Schedule {
             .map(|(i, _)| i)
             .collect();
         for i in due {
+            if omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some() {
+                // [ROLLBACK days-95] which tour is put out, with its mask and the day's bits
+                let d = &self.departures[i];
+                log::info!("timetable: departure of line {} tour {} at {:.0} s: mask {} (today's bits {:?}, date {})", d.line, d.tour, d.time, d.mask, self.day_bits, self.day);
+            }
             self.departures[i].spawned = true;
             // the tour's bus is still on its way here: it takes the trip on when it arrives
             if self.tour_prev[i].and_then(|k| self.tour_bus(k, traffic)).is_some() {

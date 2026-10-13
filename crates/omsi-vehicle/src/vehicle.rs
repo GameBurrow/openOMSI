@@ -101,6 +101,9 @@ pub struct Vehicle {
     pub passenger_cabin: Option<String>,
     pub scripts: ScriptSet,
     pub script_share: bool,
+    /// [ROLLBACK intsep-122] `[int_sounds_separate]`: the sections of an articulated bus keep their
+    /// interior sounds to themselves (a rear section's `.ovh` can carry it too).
+    pub int_sounds_separate: bool,
     pub cameras_driver: Vec<Camera>,
     pub cameras_pax: Vec<Camera>,
     pub cameras_reflexion: Vec<Camera>,
@@ -333,6 +336,7 @@ impl Vehicle {
                 "script" => v.scripts.scripts.extend(read_list(&mut r, &base)),
                 "constfile" => v.scripts.constfiles.extend(read_list(&mut r, &base)),
                 "scriptshare" => v.script_share = true,
+                "int_sounds_separate" => v.int_sounds_separate = true,
                 "add_camera_driver" => v.cameras_driver.push(read_camera(&mut r, false)),
                 "add_camera_pax" => v.cameras_pax.push(read_camera(&mut r, false)),
                 "add_camera_reflexion" => v.cameras_reflexion.push(read_camera(&mut r, false)),

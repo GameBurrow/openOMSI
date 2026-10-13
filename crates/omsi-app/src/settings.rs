@@ -80,6 +80,8 @@ pub struct Settings {
     /// `[AIMaxCountParked]`: parked cars placed in the loaded tiles (0 = every space, -1 =
     /// none at all).
     pub ai_max_parked: i32,
+    /// [ROLLBACK parkedpct-98] percent of the car park spaces that hold a car
+    pub ai_parked_pct: i32,
     /// `[AIMaxCountRandom]`'s second line: Omsi.exe makes this many people at the start and
     /// no more (0x709274, "Create Humans") - everybody waiting, walking and riding comes out
     /// of them, and at most half walk the pavements (0x62463c).
@@ -114,12 +116,18 @@ pub struct Settings {
     pub language: String,
     /// What passengers say: `all`, `tickets` (only what they ask for) or `off`.
     pub pax_voices: String,
+    /// [ROLLBACK paxvoice-99] passengers greet the driver / say which ticket they want / complain
+    pub pax_greet: bool,
+    pub pax_ticket: bool,
+    pub pax_complain: bool,
     /// OMSI 2's route arrows over the road (as well as or instead of the navigator).
     pub nav_arrows: bool,
     /// [ROLLBACK helpers-50] The route arrows OMSI generates along the route (the junction
     /// arrows, the bus stops' ones) as opposed to the `[helparrow]` objects a map has put up
     /// itself. Off by default: with `nav_arrows` on only the map's own arrows show.
     pub nav_arrows_auto: bool,
+    /// [ROLLBACK petrol-93] Refuelling and washing do not ask for a petrol station nearby.
+    pub skip_petrol_check: bool,
     /// The other (AI) vehicles as dots on the navigator's and the city map.
     pub nav_ai: bool,
     /// The driver may get up from the seat and walk about (Ctrl+Shift+G).
@@ -383,7 +391,7 @@ impl Settings {
     }
     /// The defaults of a computer.
     fn desktop() -> Self {
-        Self { msaa: 4, anisotropy: 8, ssao: true, shadows: true, shadow_size: 2048, shadow_blobs: true, navigator: true, ui_opacity: 0.85, notes: true, ui_scale: 1.0, ui_scale_window: true, navigator_corner: "bottom-left".into(), boarding: "auto".into(), detail_textures: true, exact_fare: true, trip_summary: true, enhanced: false, graphics: "vanilla_plus".into(), triple: Default::default(), triple_span: true, triple_hud_center: true, vr: false, vr_scale: 0.65, vr_head_smoothing_ms: 0.0, vr_mirror_rate: 16.0, vr_desktop_mirror: true, fullscreen: false, vsync: true, volume: 0.6, drive_keys: "simple".into(), post_aa: "fxaa".into(), render_scale: 0.0, language: "ENG".into(), pax_voices: "all".into(), nav_arrows: false, nav_arrows_auto: false, nav_ai: true, get_up: false, texture_compression: true, texture_memory: 0, auto_clutch: true, momentary_gears: false, auto_shift: false, min_obj_size: 0.013, max_obj_dist: -1.0, max_fps: 0, chat: true, chat_size: 1.0, tooltips: true, name_tags: true, show_fps: false, clouds: true, pax_density: 1.0, pax_sit: 1.0, vol_ai: 1.0, vol_scenery: 1.0, mirror_size: 256, mirror_hud: 0, mirror_refresh: "full".into(), doppler: true, driver: true, maintenance: 0, ai_unsched_factor: 1.0, ai_max_scheduled: 0, ai_max_parked: 0, ai_max_humans: 200, collision_vehicles: true, collision_objects: true, collision_pedestrians: true, head_movement: true, driverview_smooth: true, hands_in_cab: false, alt_view: true, precision_zoom: false, time_speed: 1.0, time_sync: false, metar_sync: false, metar_station: String::new(), machine_translation: false, shadow_casters: "all".into(), ctrl_deadzone: 0.0, right_stick_look: true, ctrl_off: String::new(), steering_linear: false, old_steering: false, red_steer_spd: false, reflections: true, rt_reflections: "off".into(), rt_shadows: false, lamp_fill: true, led_glow: 6, led_mips: 1.3, radio_fx_speaker: 0.0, radio_fx_noise: 0.0, radio_fx_dropouts: 0.0, developer_tools: false, mouse_sens: 1.0, graphics_api: "auto".into(), ff_invert: false, ff_enabled: true, ff_road_vib: 1.0, ff_engine_vib: 1.0, ff_fade: 0.28, brake_hold: true, mouse_steering: false, mouse_right_off: false, mouse_smooth: true, look_sens: 1.0, look_smoothing_ms: 0.0, blinker_cancel: true, wheel_range: 900.0, wheel_lock: 0.0, fov: 0.0, camera_collision: true, steer_look: false, steer_look_angle: 30.0, steer_look_response: 0.25, head_idle: 0.0, head_idle_pace: 1.0, pedal_throttle: 1.0, pedal_brake: 1.0, seat: [0.0; 3], seat_pitch_deg: 0.0, head_tracking: false, head_tracking_port: 4242, head_tracking_invert: String::new(), discord_status: true, discord_app_id: String::new(), voice_chat: true, info_bar: false, imperial: false }
+        Self { msaa: 4, anisotropy: 8, ssao: true, shadows: true, shadow_size: 2048, shadow_blobs: true, navigator: true, ui_opacity: 0.85, notes: true, ui_scale: 1.0, ui_scale_window: true, navigator_corner: "bottom-left".into(), boarding: "auto".into(), detail_textures: true, exact_fare: true, trip_summary: true, enhanced: false, graphics: "vanilla_plus".into(), triple: Default::default(), triple_span: true, triple_hud_center: true, vr: false, vr_scale: 0.65, vr_head_smoothing_ms: 0.0, vr_mirror_rate: 16.0, vr_desktop_mirror: true, fullscreen: false, vsync: true, volume: 0.6, drive_keys: "simple".into(), post_aa: "fxaa".into(), render_scale: 0.0, language: "ENG".into(), pax_voices: "all".into(), pax_greet: true, pax_ticket: true, pax_complain: false, nav_arrows: false, nav_arrows_auto: false, skip_petrol_check: false, nav_ai: true, get_up: false, texture_compression: true, texture_memory: 0, auto_clutch: true, momentary_gears: false, auto_shift: false, min_obj_size: 0.013, max_obj_dist: -1.0, max_fps: 0, chat: true, chat_size: 1.0, tooltips: true, name_tags: true, show_fps: false, clouds: true, pax_density: 1.0, pax_sit: 1.0, vol_ai: 1.0, vol_scenery: 1.0, mirror_size: 256, mirror_hud: 0, mirror_refresh: "full".into(), doppler: true, driver: true, maintenance: 0, ai_unsched_factor: 1.0, ai_max_scheduled: 0, ai_max_parked: 0, ai_parked_pct: 75, ai_max_humans: 200, collision_vehicles: true, collision_objects: true, collision_pedestrians: true, head_movement: true, driverview_smooth: true, hands_in_cab: false, alt_view: true, precision_zoom: false, time_speed: 1.0, time_sync: false, metar_sync: false, metar_station: String::new(), machine_translation: false, shadow_casters: "all".into(), ctrl_deadzone: 0.0, right_stick_look: true, ctrl_off: String::new(), steering_linear: false, old_steering: false, red_steer_spd: false, reflections: true, rt_reflections: "off".into(), rt_shadows: false, lamp_fill: true, led_glow: 6, led_mips: 1.3, radio_fx_speaker: 0.0, radio_fx_noise: 0.0, radio_fx_dropouts: 0.0, developer_tools: false, mouse_sens: 1.0, graphics_api: "auto".into(), ff_invert: false, ff_enabled: true, ff_road_vib: 1.0, ff_engine_vib: 1.0, ff_fade: 0.28, brake_hold: true, mouse_steering: false, mouse_right_off: false, mouse_smooth: true, look_sens: 1.0, look_smoothing_ms: 0.0, blinker_cancel: true, wheel_range: 900.0, wheel_lock: 0.0, fov: 0.0, camera_collision: true, steer_look: false, steer_look_angle: 30.0, steer_look_response: 0.25, head_idle: 0.0, head_idle_pace: 1.0, pedal_throttle: 1.0, pedal_brake: 1.0, seat: [0.0; 3], seat_pitch_deg: 0.0, head_tracking: false, head_tracking_port: 4242, head_tracking_invert: String::new(), discord_status: true, discord_app_id: String::new(), voice_chat: true, info_bar: false, imperial: false }
     }
 }
 
@@ -404,6 +412,11 @@ impl Settings {
     pub fn resolution() -> Option<(u32, u32)> {
         let text = std::fs::read_to_string(Self::path()?).ok()?;
         resolution_of(&text)
+    }
+
+    /// [ROLLBACK paxvoice-99] What passengers may say, as `Humans::voices` wants it.
+    pub fn pax_voice_mask(&self) -> u8 {
+        self.pax_greet as u8 | (self.pax_ticket as u8) << 1 | (self.pax_complain as u8) << 2
     }
 
     pub fn load() -> Settings {
@@ -536,9 +549,13 @@ impl Settings {
                     }
                 }
                 "language" | "lang" => s.language = crate::describe::language_code(v),
+                "pax_greet" => s.pax_greet = b(v),
+                "pax_ticket" => s.pax_ticket = b(v),
+                "pax_complain" => s.pax_complain = b(v),
                 "pax_voices" => s.pax_voices = match v.to_ascii_lowercase().as_str() { "tickets" => "tickets".into(), "off" | "0" | "none" => "off".into(), _ => "all".into() },
                 "nav_arrows" => s.nav_arrows = b(v),
                 "nav_arrows_auto" => s.nav_arrows_auto = b(v),
+                "skip_petrol_check" => s.skip_petrol_check = b(v),
                 "nav_ai" => s.nav_ai = b(v),
                 "get_up" => s.get_up = b(v),
                 "texture_compression" => s.texture_compression = b(v),
@@ -579,6 +596,7 @@ impl Settings {
                 "ai_max_scheduled" | "aimaxcountscheduled" => s.ai_max_scheduled = v.parse().unwrap_or(s.ai_max_scheduled),
                 "ai_max_humans" | "aimaxhumans" => s.ai_max_humans = v.parse::<u32>().map(|x| x.max(1)).unwrap_or(s.ai_max_humans),
                 "ai_max_parked" | "aimaxcountparked" => s.ai_max_parked = v.parse::<i32>().map(|x| x.max(-1)).unwrap_or(s.ai_max_parked),
+                "ai_parked_pct" => s.ai_parked_pct = v.trim_end_matches('%').parse::<i32>().map(|x| x.clamp(0, 100)).unwrap_or(s.ai_parked_pct),
                 "collision_vehicles" => s.collision_vehicles = b(v),
                 "collision_objects" => s.collision_objects = b(v),
                 "collision_pedestrians" => s.collision_pedestrians = b(v),
@@ -731,7 +749,7 @@ impl Settings {
         text.push_str(&format!("right_stick_look={}\n", self.right_stick_look as u8));
         text.push_str(&format!("voice_chat={}\n", self.voice_chat as u8));
         text.push_str(&format!("developer_tools={}\n", self.developer_tools as u8));
-        text.push_str(&format!("rt_shadows={}\nrt_reflections={}\nlamp_fill={}\nnav_arrows_auto={}\n", self.rt_shadows as u8, self.rt_reflections, self.lamp_fill as u8, self.nav_arrows_auto as u8));
+        text.push_str(&format!("rt_shadows={}\nrt_reflections={}\nlamp_fill={}\nnav_arrows_auto={}\nskip_petrol_check={}\n", self.rt_shadows as u8, self.rt_reflections, self.lamp_fill as u8, self.nav_arrows_auto as u8, self.skip_petrol_check as u8));
         text
     }
 

@@ -66,7 +66,8 @@ struct Look {
 
 static TILES: [Def; 12] = [
     Def { id: "place", icon: "directions_bus", badge: "add", label: "Place a vehicle", tip: "Place a vehicle of your choice" },
-    Def { id: "swap", icon: "directions_bus", badge: "sync_alt", label: "Swap for another vehicle", tip: "Put another vehicle in this one's place and drive it" },
+    // [ROLLBACK takeover-123] was "Swap for another vehicle" (another one in this one's place): the tile now lists the vehicles standing in the world to take the wheel of
+    Def { id: "switch", icon: "directions_bus", badge: "sync_alt", label: "Swap for another vehicle", tip: "Choose another of your vehicles standing in the world and take its wheel" },
     Def { id: "remove", icon: "directions_bus", badge: "close", label: "Remove this vehicle", tip: "Removes the current vehicle" },
     Def { id: "tplist", icon: "location_on", badge: "", label: "Teleport to a start point", tip: "Teleport to a starting point on the map" },
     Def { id: "duty", icon: "departure_board", badge: "", label: "Line and tour", tip: "Choose the line, tour and stop to drive from" },
@@ -276,8 +277,10 @@ impl App {
     fn quick_off(&self, id: &str) -> bool {
         let has = self.player.is_some();
         match id {
-            "swap" | "remove" | "dest" | "repair" | "washfuel" => !has,
-            "tplist" => !has || self.navigator.is_none() || crate::input_script::on_server(&self.args),
+            "remove" | "dest" | "repair" | "washfuel" => !has,
+            "switch" => self.placed.is_empty() && !has,
+            // [ROLLBACK walkmenus-125] not on foot: it moves the vehicle at the wheel
+            "tplist" => !has || self.on_foot.is_some() || self.navigator.is_none() || crate::input_script::on_server(&self.args),
             "time" => self.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client),
             _ => false,
         }
@@ -319,7 +322,7 @@ impl App {
         }
         match def.id {
             // what is chosen from a list: the menu goes, the list comes, the game runs on
-            "place" | "swap" | "dest" | "tplist" => {
+            "place" | "switch" | "dest" | "tplist" => {
                 self.quick.open = false;
                 self.quick_open_session();
                 self.page_action(def.id);

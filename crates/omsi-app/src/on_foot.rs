@@ -348,10 +348,7 @@ impl App {
         if self.on_foot.is_some() {
             return;
         }
-        if !self.settings.get_up {
-            self.service_msg = Some(("Getting up is off: turn on \"Ability to get up\" in the settings".into(), 5.0));
-            return;
-        }
+        // [ROLLBACK walkmenus-125] always possible: the setting "Ability to get up" is gone
         // the other vehicles round the own bus (room to step out)
         let others: Vec<Obb> = {
             let at = self.player.as_ref().map(|p| p.vehicle.position.truncate()).unwrap_or_default();
@@ -812,7 +809,11 @@ impl App {
     /// The keys on foot (and Ctrl+Shift+G at the wheel); true when the key was taken.
     pub(crate) fn foot_key(&mut self, code: KeyCode, pressed: bool, repeat: bool, ctrl: bool, shift: bool) -> bool {
         if self.on_foot.is_none() {
-            if pressed && !repeat && code == KeyCode::KeyG && ctrl && shift && self.player.is_some() {
+            // [ROLLBACK walkmenus-125] the key is the player's (`walk_getup`, Ctrl+Shift+G unless moved)
+            let alt = self.keys.contains(&KeyCode::AltLeft) || self.keys.contains(&KeyCode::AltRight);
+            let m = omsi_content::input::chord(shift, ctrl, alt);
+            let hit = crate::keys::dik_code(code).is_some_and(|sc| self.game_keys.iter().any(|b| b.action.eq_ignore_ascii_case("walk_getup") && b.scan_code == sc && b.matches(m)));
+            if pressed && !repeat && hit && self.player.is_some() {
                 self.get_up();
                 return true;
             }
@@ -1102,11 +1103,12 @@ impl App {
                     'buses: for bus in h.bus_ids_near(f.pos, 25.0) {
                         for (inside, outside, _, open) in h.cabin_doors(bus) {
                             // (only through a door that is open, whoever's bus it is)
-                            if !open || (outside.truncate() - f.pos.truncate()).length() > 0.9 {
+                            if !open || (outside.truncate() - f.pos.truncate()).length() > 0.45 {  // [ROLLBACK pull-95] was 0.9 m
                                 continue;
                             }
                             let Some((wi, _)) = h.cabin_world(bus, inside) else { continue };
-                            if (wi.truncate() - outside.truncate()).dot(f.vel) > 0.0 {
+                            // [ROLLBACK pull-95] walking straight at the door (within ~53 deg), not just past it
+                            if (wi.truncate() - outside.truncate()).normalize_or_zero().dot(f.vel.normalize_or_zero()) > 0.6 {
                                 // up the step into the bus, walked
                                 f.transit = Some(Transit::walk(f.pos, wi, Some((bus, inside))));
                                 f.lift = 0.0;

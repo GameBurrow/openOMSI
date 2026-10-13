@@ -311,7 +311,7 @@ fn corona_shape(in: CoronaOut) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: CoronaOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color.rgb * corona_shape(in) * in.color.a, 1.0);
+    return vec4<f32>(finish_output(in.color.rgb * corona_shape(in) * in.color.a), 1.0);
 }
 
 // Enhanced graphics: the corona in the pre-exposed high-range picture - the glare of a
@@ -356,7 +356,8 @@ fn smoke_color(in: CoronaOut) -> vec4<f32> {
 
 @fragment
 fn fs_smoke(in: CoronaOut) -> @location(0) vec4<f32> {
-    return smoke_color(in);
+    let c = smoke_color(in);
+    return vec4<f32>(finish_output(c.rgb), c.a);
 }
 
 @fragment

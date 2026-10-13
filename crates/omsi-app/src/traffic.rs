@@ -55,6 +55,305 @@ pub fn warm_up(world: &World, ty: &Arc<VehicleType>, hof: Option<Arc<omsi_vehicl
     }
 }
 
+/// The loaded tiles' road surfaces, as the world keeps them.
+type Surfaces = Arc<parking_lot::RwLock<HashMap<(i32, i32), Arc<omsi_geometry::TileSurface>>>>;
+
+/// [ROLLBACK tune-104] Values of the avoidance procedures that the developer tools' sliders
+/// set while the game runs: (key, label, default, least, most, step). The game reads them
+/// through `tune(T_...)`; the tools window sends `tune <key> <value>`.
+#[rustfmt::skip]
+pub(crate) const TUNE: [(&str, &str, f32, f32, f32, f32); 13] = [
+    ("sq_max_dev", "Furthest sideways bend of the way (m)", 3.0, 0.5, 5.0, 0.1),
+    ("sq_step", "Ground grid: step across (m)", 0.25, 0.1, 0.5, 0.05),
+    ("sq_side_margin", "Margin beside the player's vehicle (m)", 0.35, 0.0, 1.0, 0.05),
+    ("sq_bus_clear", "Clearance wanted to the vehicle (m)", 0.55, 0.0, 1.5, 0.05),
+    ("sq_edge_clear", "Clearance wanted to kerb or edge (m)", 0.3, 0.0, 1.0, 0.05),
+    ("sq_ramp_gentle", "Gentle bend: metres along per metre sideways", 8.0, 2.0, 20.0, 0.5),
+    ("sq_ramp_per_m", "Steepest bend: metres along per metre sideways", 3.0, 1.0, 10.0, 0.5),
+    ("sq_w_safe", "Cost of missing clearance", 2.0, 0.0, 10.0, 0.5),
+    ("sq_w_onc", "Cost of using the oncoming lane", 0.5, 0.0, 5.0, 0.1),
+    ("sq_oncoming", "Bend onto the oncoming lane allowed (0 no, 1 yes)", 1.0, 0.0, 1.0, 1.0),
+    ("sq_retry", "Look again every (s)", 0.4, 0.1, 2.0, 0.1),
+    ("sq_lane_frac", "Vehicle counts as on the lane from this share of its width", 0.5, 0.0, 1.0, 0.05),
+    ("sq_junction_m", "Junction or light this far past the vehicle: no passing (m)", 25.0, 0.0, 80.0, 1.0),
+];
+const T_MAX_DEV: usize = 0;
+const T_STEP: usize = 1;
+const T_SIDE: usize = 2;
+const T_BUS_CLEAR: usize = 3;
+const T_EDGE_CLEAR: usize = 4;
+const T_RAMP_GENTLE: usize = 5;
+const T_RAMP_PER_M: usize = 6;
+const T_W_SAFE: usize = 7;
+const T_W_ONC: usize = 8;
+const T_ONCOMING: usize = 9;
+const T_RETRY: usize = 10;
+const T_LANE_FRAC: usize = 11;
+const T_JUNCTION: usize = 12;
+/// (all ones: not set, the default holds)
+static TUNE_BITS: [std::sync::atomic::AtomicU32; 13] =
+    [const { std::sync::atomic::AtomicU32::new(u32::MAX) }; 13];
+
+pub(crate) fn tune(i: usize) -> f32 {
+    let bits = TUNE_BITS[i].load(std::sync::atomic::Ordering::Relaxed);
+    if bits == u32::MAX {
+        TUNE[i].2
+    } else {
+        f32::from_bits(bits)
+    }
+}
+
+/// Set a value by its key (kept within its range); `false` for a key not known.
+pub(crate) fn set_tune(key: &str, value: f32) -> bool {
+    let Some(i) = TUNE.iter().position(|t| t.0 == key) else {
+        return false;
+    };
+    if !value.is_finite() {
+        return false;
+    }
+    let t = &TUNE[i];
+    TUNE_BITS[i].store(
+        value.clamp(t.3, t.4).to_bits(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    true
+}
+
+fn smooth_step(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// [ROLLBACK corridor-104] The road in front of a car: its way as the lane lays it out (no
+/// sideways offset) every metre (`rows`: the point and its right-hand direction), and the
+/// ground along it as a grid - every 2 m along, every `step` m across, as far to either side
+/// as the furthest bend goes and the car's half width beside it. Every cell holds what the
+/// ground there is at the road's height (0 fine, 1 kerb or wall, 2 drop, 3 no asphalt). The
+/// road does not change while the car drives it, so one grid serves for a few dozen metres
+/// and many seconds ([ROLLBACK deform-105]): `odo` is the car's odometer where it starts.
+#[derive(Debug, Clone, Default)]
+pub struct Corridor {
+    odo: f32,
+    time: f32,
+    reach: f32,
+    step: f32,
+    half: i32,
+    n: usize,
+    rows: Vec<(DVec3, DVec2)>,
+    /// Per ground row: the way's point, its right-hand direction, the road's height (NaN: no
+    /// ground).
+    pts: Vec<(DVec2, DVec2, f64)>,
+    codes: Vec<u8>,
+}
+
+impl Corridor {
+    const DS: f32 = 2.0;
+
+    fn cols(&self) -> i32 {
+        2 * self.half + 1
+    }
+
+    fn col(&self, off: f32) -> i32 {
+        (off / self.step).round() as i32 + self.half
+    }
+
+    fn at(&self, k: usize, j: i32) -> u8 {
+        if j < 0 || j >= self.cols() {
+            return 0;
+        }
+        self.codes[k * self.cols() as usize + j as usize]
+    }
+
+    /// The car's body, its offset from the way `prof(d)` at `d` m ahead of the car (the grid
+    /// starts `shift` m behind it), for `reach` m: (the first bad ground under it, 0 for
+    /// none; the clearance to bad ground beside it, up to `want` m).
+    fn check_profile(
+        &self,
+        shift: f32,
+        prof: &dyn Fn(f32) -> f32,
+        reach: f32,
+        hw: f32,
+        want: f32,
+    ) -> (u8, f32) {
+        let mut clear = want;
+        let m = (want / self.step).ceil() as i32;
+        for k in 0..self.n {
+            let d = k as f32 * Self::DS - shift;
+            if d < -0.5 || d > reach {
+                continue;
+            }
+            let o = prof(d.max(0.0));
+            let (a, b) = (self.col(o - hw), self.col(o + hw));
+            for j in a..=b {
+                let c = self.at(k, j);
+                if c != 0 {
+                    return (c, 0.0);
+                }
+            }
+            for e in 1..=m {
+                if self.at(k, b + e) != 0 {
+                    clear = clear.min((e as f32 - 0.5) * self.step);
+                    break;
+                }
+            }
+            for e in 1..=m {
+                if self.at(k, a - e) != 0 {
+                    clear = clear.min((e as f32 - 0.5) * self.step);
+                    break;
+                }
+            }
+        }
+        (0, clear.max(0.0))
+    }
+}
+
+/// [ROLLBACK deform-105] The player's box as `player_on_way` tests it (the box grown by the
+/// car's half width and a margin to each side, a margin at its ends): a point in it, and
+/// the stretch of a line through a point that lies in it.
+#[derive(Debug, Clone, Copy)]
+struct BoxTest {
+    centre: DVec3,
+    fwd: DVec2,
+    right: DVec2,
+    wide: f64,
+    ahead: f64,
+    behind: f64,
+}
+
+impl BoxTest {
+    fn contains(&self, p: DVec3) -> bool {
+        in_player_box(
+            p,
+            self.centre,
+            self.fwd,
+            self.right,
+            self.wide,
+            self.ahead,
+            self.behind,
+        )
+    }
+
+    /// The offsets `o` (m) for which the point `c + dir * o` lies in the box, as (least,
+    /// most); `None` when the line misses it.
+    fn interval(&self, c: DVec3, dir: DVec2) -> Option<(f32, f32)> {
+        if (c.z - self.centre.z).abs() >= 4.0 {
+            return None;
+        }
+        let rel = c.truncate() - self.centre.truncate();
+        let mut lo = f64::NEG_INFINITY;
+        let mut hi = f64::INFINITY;
+        let limits = [
+            (
+                rel.dot(self.right),
+                dir.dot(self.right),
+                -self.wide,
+                self.wide,
+            ),
+            (
+                rel.dot(self.fwd),
+                dir.dot(self.fwd),
+                -self.behind,
+                self.ahead,
+            ),
+        ];
+        for (a, b, min, max) in limits {
+            if b.abs() < 1e-9 {
+                if a < min || a > max {
+                    return None;
+                }
+                continue;
+            }
+            let (o1, o2) = ((min - a) / b, (max - a) / b);
+            lo = lo.max(o1.min(o2));
+            hi = hi.min(o1.max(o2));
+        }
+        (lo <= hi && lo.is_finite() && hi.is_finite()).then_some((lo as f32, hi as f32))
+    }
+}
+
+/// [ROLLBACK deform-105] The offsets (m, positive = away from the box) of a way bent round
+/// the box: `bound[k]` the least offset the way needs `k` m ahead (-inf: none). It starts at
+/// `u0`, moves by at most `slope` m to the metre, never goes under a bound (which is itself
+/// brought down by the slope on both sides of a place that needs it), and comes back to the
+/// middle of the lane after it. `None` when the start is too steep for the first bound.
+fn deform(bound: &[f32], u0: f32, slope: f32) -> Option<Vec<f32>> {
+    let n = bound.len();
+    if n == 0 {
+        return None;
+    }
+    let mut b = bound.to_vec();
+    for k in 1..n {
+        b[k] = b[k].max(b[k - 1] - slope);
+    }
+    for k in (0..n - 1).rev() {
+        b[k] = b[k].max(b[k + 1] - slope);
+    }
+    if b[0] > u0 + 0.05 {
+        return None;
+    }
+    let mut u = Vec::with_capacity(n);
+    u.push(u0.max(b[0]));
+    for k in 1..n {
+        let target = b[k].max(0.0);
+        let prev = u[k - 1];
+        let v = if prev < target {
+            (prev + slope).min(target)
+        } else {
+            (prev - slope).max(target)
+        };
+        u.push(v.max(b[k]));
+    }
+    Some(u)
+}
+
+/// What the ground at `q` is, with the road at height `road`: 0 fine, 1 a face within 35 cm
+/// above the road (a kerb, an island, a wall), 2 a drop of more than 15 cm, 3 no asphalt
+/// there (`sample_road` of the tile).
+fn ground_code(
+    probe: &dyn Fn(f64, f64, f64) -> omsi_sim::rigid::GroundProbe,
+    surfaces: Option<&HashMap<(i32, i32), Arc<omsi_geometry::TileSurface>>>,
+    tile: f64,
+    q: DVec2,
+    road: f64,
+    asphalt: bool,
+) -> u8 {
+    let g = probe(q.x, q.y, road + 0.05);
+    if g.above.is_some_and(|z| z < road + 0.35) {
+        return 1;
+    }
+    if g.below.is_some_and(|z| z < road - 0.15) {
+        return 2;
+    }
+    if let (true, Some(surfaces)) = (asphalt, surfaces) {
+        let key = ((q.x / tile).floor() as i32, (q.y / tile).floor() as i32);
+        if let Some(surface) = surfaces.get(&key) {
+            let lx = (q.x - key.0 as f64 * tile) as f32;
+            let ly = (q.y - key.1 as f64 * tile) as f32;
+            match surface.sample_road(lx, ly) {
+                Some(h) if (h as f64 - road).abs() < 0.12 => {}
+                _ => return 3,
+            }
+        }
+    }
+    0
+}
+
+/// [ROLLBACK avoiddbg-102] What the avoidance procedures of a car last found, for the debug
+/// view (`aicolls`): why the correction (`squeeze`) and the pass did not start, every sideways
+/// move it tried ([ROLLBACK corridor-104]: verdict 0 chosen, 1 possible, 2 the vehicle in the
+/// way, 3 bad ground, 4 traffic; and its way) and the ground it looked at (code 0 fine, 1
+/// kerb, 2 drop, 3 no asphalt).
+#[derive(Debug, Clone, Default)]
+pub struct AvoidDbg {
+    pub squeeze: String,
+    pub pass: String,
+    pub cands: Vec<(u8, Vec<DVec3>)>,
+    pub marks: Vec<(DVec3, u8)>,
+    pub corridor: Option<Corridor>,
+    /// [ROLLBACK deform-105] How much of the player's vehicle's width lies in the lane (0..1).
+    pub frac: f32,
+}
+
 /// Pulling out onto the other half of the road round something standing in the lane.
 #[derive(Debug, Clone, Copy)]
 pub struct Passing {
@@ -76,6 +375,9 @@ pub struct Passing {
     /// Started from a standstill close behind the obstacle: the car edges out
     /// (`PULL_OUT_ACCEL`) until its front is past the obstacle's corner.
     pub creep: bool,
+    /// [ROLLBACK buspass-101] Going round the player's vehicle: given up if its indicator
+    /// comes on towards the traffic before the car is level with it.
+    pub by_player: bool,
 }
 
 impl Passing {
@@ -210,6 +512,12 @@ pub struct AiCar {
     pub wait_at: Option<f32>,
     /// The vehicle (by id) standing half out of the lane that this car is squeezing past.
     pub squeeze: Option<u64>,
+    /// [ROLLBACK squeeze-101] Moving over (m, sideways) to go by the standing player's vehicle
+    /// within its lane, kept until the odometer reads the second number; and when to look
+    /// again.
+    pub squeeze_p: Option<(f32, f32)>,
+    pub squeeze_t: f32,
+    pub avoid: AvoidDbg,
     /// How far behind something standing (a bus at its stop, the player's bus) this car
     /// stops, so that it can steer out round it later (m, front bumper to the other's body;
     /// from its own steering, `pull_out_room`).
@@ -646,6 +954,9 @@ pub struct Traffic {
     /// was taken for standing in the lane of the oncoming cars, which stopped for it).
     player_kappa: f32,
     player_prev_heading: Option<f64>,
+    /// [ROLLBACK avoiddbg-102] The loaded tiles' road surfaces (for `kerb_clear`: asphalt must
+    /// lie under the whole swath of a move over).
+    surfaces: Option<Surfaces>,
     /// The player's bus has right of way over the traffic (its script's `TrafficPriority`,
     /// OMSI: priority 1000 over the types' own): cars keep out of the way it is about
     /// to take for longer.
@@ -1463,6 +1774,7 @@ impl Traffic {
             player: None,
             player_kappa: 0.0,
             player_prev_heading: None,
+            surfaces: None,
             player_priority: false,
             player_blinker: 0,
             player_signal_age: f32::MAX,
@@ -2003,6 +2315,7 @@ impl Traffic {
         if self.mirror {
             return;
         }
+        self.surfaces = Some(world.surfaces.clone());
         if self.viewer.is_none() {
             if let Some(f) = view {
                 self.viewer = Some(Viewer {
@@ -2411,7 +2724,18 @@ impl Traffic {
                 // as many cars on a lane as metres of it (times its density): counted per
                 // lane, the many short lanes of a junction drew the cars into the town's
                 // tangles and left the long roads between them empty
-                .map(|(i, l)| (i, l.length() * l.density.clamp(0.05, 4.0)))
+                // [ROLLBACK crowd-96] and the nearer the player, the likelier: a low target
+                // went out over the whole 400 m round and left the streets about the player
+                // empty
+                .map(|(i, l)| {
+                    let near = if kind == LaneKind::Street {
+                        let d = ((l.start() - center).truncate().length() / 150.0) as f32;
+                        1.0 / (1.0 + d * d)
+                    } else {
+                        1.0
+                    };
+                    (i, l.length() * l.density.clamp(0.05, 4.0) * near)
+                })
                 .collect::<Vec<(usize, f32)>>()
         };
         let mut candidates = pick(true);
@@ -2919,6 +3243,9 @@ impl Traffic {
             junction_why: String::new(),
             wait_at: None,
             squeeze: None,
+            squeeze_p: None,
+            squeeze_t: 0.0,
+            avoid: AvoidDbg::default(),
             pass_room,
             pass_retry: 0.0,
             light_at: None,
@@ -3134,8 +3461,14 @@ impl Traffic {
         };
         if let Some(c) = me.change {
             // along the way it has chosen from the new lane
-            if let Some(o) =
-                self.obstacle_from(i, c.to, c.s_to, Some(&me.change_plan), look, by_lane)
+            // [ROLLBACK lanechange-108] while it only signals (it has not moved yet) the cars
+            // of the new lane hold it only when they are close: it checked that lane before
+            // it began, and braking for a car 20 m ahead there stopped a plain change of
+            // lane on a straight road for no reason
+            let signalling = c.wait > 0.0 && c.t <= 0.0 && !c.bypass;
+            if let Some(o) = self
+                .obstacle_from(i, c.to, c.s_to, Some(&me.change_plan), look, by_lane)
+                .filter(|o| !signalling || o.0 < 6.0)
             {
                 if best.map(|b| o.0 < b.0).unwrap_or(true) {
                     best = Some(o);
@@ -3361,7 +3694,8 @@ impl Traffic {
                     || (o.stopped > 25.0 && !o.held && self.cars[i].stopped > 6.0)
                     || (o.stopped > 3.0 && self.standing_queue(j).1)
             }
-            Some(_) => player_standing > 10.0,
+            // [ROLLBACK buspass-101] (4 s: a bus at a stop is not waited behind for ten)
+            Some(_) => player_standing > 4.0,
             None => parked_ahead,
         }
     }
@@ -3468,6 +3802,571 @@ impl Traffic {
         }
     }
 
+    /// [ROLLBACK deform-105] The way of car `i` is not to be bent round the player's vehicle
+    /// (nor the vehicle passed) where passing is none of its business: a traffic light, a
+    /// junction or a crossing on the way up to `sq_junction_m` beyond the vehicle's tail
+    /// (it stands there to let the traffic through), or a road that forks. Says what it found.
+    fn passing_zone(&self, i: usize, gap: f32, p: &PlayerBox) -> Option<String> {
+        let st = &self.cars[i].state;
+        let within = st.front + gap + p.2 * 2.0 + tune(T_JUNCTION);
+        for &(l, d) in &self.way_lanes(st, within + 30.0) {
+            if d > within {
+                break;
+            }
+            let lane = &self.net.lanes[l];
+            if lane.traffic_light.is_some() {
+                return Some("a traffic light on the way: no passing".to_string());
+            }
+            if !self.net.crossings[l].is_empty() {
+                return Some("a junction on the way: no passing".to_string());
+            }
+            if !self.net.walks[l].is_empty() {
+                return Some("a crossing on the way: no passing".to_string());
+            }
+            if lane.next.len() > 1 && d + lane.length() < within {
+                return Some("the road forks: no passing".to_string());
+            }
+        }
+        None
+    }
+
+    /// [ROLLBACK deform-105] How much of the player's vehicle's width lies in the lane of car
+    /// `i` where its way runs into the vehicle (0..1): all of it stands on the lane, a corner
+    /// only reaches into it.
+    fn bus_lane_share(&self, i: usize, p: &PlayerBox, gap: f32) -> f32 {
+        let car = &self.cars[i];
+        let st = &car.state;
+        let way_dir = (st.way_point(&self.net, 3.0) - st.way_point(&self.net, 0.0)).truncate();
+        let bx = self.player_box(way_dir, 0.0, 0.0, p, 0.0);
+        let lane = &self.net.lanes[st.lane];
+        let lane_half = if lane.width > 1.0 { lane.width } else { 3.0 } * 0.5;
+        let mut base = st.clone();
+        base.lateral = 0.0;
+        base.lateral_target = 0.0;
+        base.lateral_ramp = (0.0, 0.0, base.odometer, 1.0);
+        base.lateral_curve.clear();
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        let mut d = (gap + st.front - 2.0).max(0.0);
+        let end = gap + st.front + p.2 * 2.0 + 3.0;
+        while d <= end {
+            let c = base.way_point(&self.net, d);
+            let n = base.way_point(&self.net, d + 0.5);
+            let dir = (n - c).truncate().normalize_or_zero();
+            if dir != DVec2::ZERO {
+                let right = DVec2::new(dir.y, -dir.x);
+                if let Some((a, b)) = bx.interval(c, right) {
+                    lo = lo.min(a);
+                    hi = hi.max(b);
+                }
+            }
+            d += 2.0;
+        }
+        if hi <= lo {
+            return 0.0;
+        }
+        let inside = (hi.min(lane_half) - lo.max(-lane_half)).max(0.0);
+        (inside / (hi - lo)).clamp(0.0, 1.0)
+    }
+
+    /// [ROLLBACK squeeze-101] Going by the standing player's vehicle (or a LAN player's) by
+    /// bending the car's way [ROLLBACK deform-105]. The vehicle's box is a force field: where
+    /// the way runs into it (grown by the car's half width and a margin) the way is pushed
+    /// aside to just clear it, with room kept (`sq_bus_clear`), and led back to the lane after
+    /// it - bent smoothly, a metre sideways over `sq_ramp_gentle` m along when there is room,
+    /// over `sq_ramp_per_m` m at the steepest. Both sides are tried (and how much room is kept:
+    /// squeezed between the vehicle and a kerb the clearances are traded); a bend is possible
+    /// when no kerb, drop or ground that is no asphalt lies under the body (`Corridor`) and
+    /// nobody comes on the lane it reaches over onto (the oncoming lane, or the next one of its
+    /// direction); the cheapest is taken: the smallest bend, room to the vehicle and to the
+    /// edge of the road, the oncoming lane at a price. A vehicle that stands on the lane (from
+    /// `sq_lane_frac` of its width) is not bent round onto the oncoming lane: that is
+    /// `plan_pass`, the overtake. Not at a junction or light (`passing_zone`), and a bus with
+    /// its indicator out towards the traffic is about to pull out: it is waited for, and a bend
+    /// begun is let go. (What it found goes to `AiCar::avoid`, for the debug view.)
+    fn player_squeeze(
+        &mut self,
+        i: usize,
+        p: &PlayerBox,
+        standing: f32,
+        by_lane: &HashMap<usize, Vec<(usize, f32, f32, bool)>>,
+    ) -> Option<f32> {
+        let retry = tune(T_RETRY);
+        {
+            let a = &mut self.cars[i];
+            let odo = a.state.odometer;
+            if a.squeeze_p.is_some_and(|(_, until)| odo >= until) {
+                a.squeeze_p = None;
+            }
+        }
+        let car = &self.cars[i];
+        let st = &car.state;
+        let near = (car.vehicle.position - p.0).length() < 90.0;
+        let early: &str = if !near {
+            ""
+        } else if car.is_bus() {
+            // ([ROLLBACK deform-105 / bus-106] a timetable bus does not go round the player's
+            // vehicle: it queues)
+            "a bus: queues"
+        } else if standing < 1.5 {
+            "the player's vehicle is not standing"
+        } else if self.player_signal_age < 1.0 {
+            "the bus has its indicator out: waited for"
+        } else if car.passing.is_some() {
+            "already passing"
+        } else if st.change.is_some() {
+            "changing lane"
+        } else if car.is_rail() {
+            "on rails"
+        } else {
+            "-"
+        };
+        if early != "-" {
+            let a = &mut self.cars[i];
+            a.squeeze_p = None;
+            if !a.state.lateral_curve.is_empty() {
+                // a bend begun is let go: back to the lane over an S-curve
+                a.state.lateral_curve.clear();
+                let (lat, odo) = (a.state.lateral, a.state.odometer);
+                a.state.lateral_target = 0.0;
+                a.state.lateral_ramp = (lat, 0.0, odo, (lat.abs() * 6.0).clamp(8.0, 16.0));
+            }
+            a.avoid.squeeze.clear();
+            a.avoid.squeeze.push_str(early);
+            return None;
+        }
+        if let Some((w, _)) = car.squeeze_p {
+            return Some(w);
+        }
+        if self.time < car.squeeze_t {
+            return None;
+        }
+        let half_width = car.half_width;
+        let Some(base) = self.player_on_way(st, half_width, p, 0.0) else {
+            let a = &mut self.cars[i];
+            a.squeeze_t = self.time + retry;
+            a.avoid.squeeze.clear();
+            a.avoid.squeeze.push_str("the bus is not in the way");
+            a.avoid.cands.clear();
+            a.avoid.marks.clear();
+            return None;
+        };
+        let gap = base.gap;
+        let share = self.bus_lane_share(i, p, gap);
+        if let Some(reason) = self.passing_zone(i, gap, p) {
+            let time = self.time;
+            let a = &mut self.cars[i];
+            a.squeeze_t = time + retry * 2.0;
+            a.avoid.frac = share;
+            a.avoid.squeeze = reason;
+            a.avoid.cands.clear();
+            a.avoid.marks.clear();
+            return None;
+        }
+        let stands = share >= tune(T_LANE_FRAC);
+        let lane = &self.net.lanes[st.lane];
+        let lane_half = if lane.width > 1.0 { lane.width } else { 3.0 } * 0.5;
+        let out = self.net.oncoming_sign();
+        let opposite = self.net.opposite(st.lane, st.s);
+        let max_out = match opposite {
+            Some((_, _, side)) => (side - half_width - 0.2).max(0.0),
+            None => f32::MAX,
+        };
+        let max_dev = tune(T_MAX_DEV);
+        let step = tune(T_STEP).max(0.1);
+        let (want_bus, want_edge) = (tune(T_BUS_CLEAR), tune(T_EDGE_CLEAR));
+        let (w_safe, w_onc) = (tune(T_W_SAFE), tune(T_W_ONC));
+        let allow_onc = tune(T_ONCOMING) >= 0.5;
+        let mut slopes = [
+            1.0 / tune(T_RAMP_GENTLE).max(1.0),
+            1.0 / tune(T_RAMP_PER_M).max(1.0),
+            0.0,
+        ];
+        slopes[2] = 0.5 * (slopes[0] + slopes[1]);
+        slopes.sort_by(|a, b| a.total_cmp(b));
+        // how far the way is to be clear: past the bus's tail, and led back after it
+        let span = st.front + gap + p.2 * 2.0 + st.rear + PLAYER_BOX_MARGIN + 0.5;
+        let need = (span + 3.0 + max_dev * tune(T_RAMP_GENTLE)).min(85.0);
+        // the road ahead and its ground: one for a few dozen metres and many seconds
+        let half_cols = ((max_dev + half_width + want_edge + 0.5) / step).ceil() as i32;
+        let reuse = car.avoid.corridor.as_ref().filter(|c| {
+            let shift = st.odometer - c.odo;
+            shift >= -0.5
+                && c.reach - shift >= need
+                && self.time - c.time < 30.0
+                && c.half == half_cols
+                && (c.step - step).abs() < 1e-4
+                && c.rows.len() > 1
+        });
+        let mut fresh: Option<Corridor> = None;
+        let corridor: &Corridor = match reuse {
+            Some(c) => c,
+            None => &*fresh.insert(self.build_corridor(i, need + 12.0, step, half_cols)),
+        };
+        let shift = st.odometer - corridor.odo;
+        let last_row = corridor.rows.len() - 1;
+        let row_at = |d: f32| corridor.rows[((d + shift).round().max(0.0) as usize).min(last_row)];
+        let n_rows = (((last_row as f32 - shift).floor() as usize) + 1)
+            .min(need.ceil() as usize + 1)
+            .max(2);
+        let way_dir = (st.way_point(&self.net, 3.0) - st.way_point(&self.net, 0.0)).truncate();
+        let lat0 = st.lateral;
+        let here = lane.at(st.s).0;
+        let mut counts = [0usize; 8];
+        let mut notes: Vec<String> = Vec::new();
+        let mut ground_kind = 0u8;
+        let mut onc: Option<Option<(u64, f32)>> = None;
+        let mut cands: Vec<(u8, Vec<DVec3>)> = Vec::new();
+        // (cost, sign, peak, offsets, last row, the index of its entry in `cands`)
+        let mut best: Option<(f32, f32, f32, Vec<f32>, usize, usize)> = None;
+        for sign in [1.0f32, -1.0] {
+            let towards_oncoming = sign * out > 0.0;
+            let u0 = sign * lat0;
+            for qi in (0..=3).rev() {
+                let extra = want_bus * qi as f32 / 3.0;
+                let bx = self.player_box(way_dir, half_width + extra, tune(T_SIDE), p, 0.0);
+                // what the way needs, row by row: to be on this side of the box
+                let mut bound = vec![f32::NEG_INFINITY; n_rows];
+                for (k, slot) in bound.iter_mut().enumerate() {
+                    let (c, r) = row_at(k as f32);
+                    if let Some((lo, hi)) = bx.interval(c, r) {
+                        // (a hair beyond the edge: a way on it is still in the box)
+                        *slot = (if sign > 0.0 { hi } else { -lo }) + 0.05;
+                    }
+                }
+                counts[7] += 1;
+                let top = bound.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                if top > max_dev {
+                    counts[1] += 1;
+                    continue;
+                }
+                let last_b = bound.iter().rposition(|b| b.is_finite()).unwrap_or(0);
+                let profile = slopes.iter().find_map(|&sl| deform(&bound, u0, sl));
+                let Some(u) = profile else {
+                    counts[4] += 1;
+                    if !notes.iter().any(|n| n.starts_with("room")) {
+                        let first = bound.iter().position(|b| b.is_finite()).unwrap_or(0);
+                        notes.push(format!(
+                            "room {:.1} m, the way needs {:.1} m aside there",
+                            first as f32, top
+                        ));
+                    }
+                    continue;
+                };
+                let peak = u.iter().copied().fold(0.0f32, f32::max);
+                let k_end = (last_b..n_rows)
+                    .find(|&k| u[k] <= 0.03)
+                    .unwrap_or(n_rows - 1);
+                let beyond = peak + half_width > lane_half;
+                // [ROLLBACK lane-107] on a road of several lanes each way the next lane of the
+                // same direction lies between: the oncoming traffic is a concern only for a
+                // body reaching over that lane too (before, the car of the other carriageway
+                // was an oncoming one for any move to that side)
+                let next = if sign > 0.0 { lane.right } else { lane.left };
+                let next_w = next
+                    .map(|n| self.net.lanes[n].width.max(2.5))
+                    .unwrap_or(0.0);
+                let onto_opp = towards_oncoming && peak + half_width > lane_half + next_w;
+                let mut verdict = 1u8;
+                let (cb, mut ce) = (extra, want_edge);
+                if towards_oncoming && peak > max_out {
+                    counts[5] += 1;
+                    verdict = 5;
+                } else if onto_opp && (!allow_onc || stands) {
+                    counts[6] += 1;
+                    verdict = 5;
+                }
+                if verdict == 1 && corridor.n > 0 {
+                    let prof = |d: f32| {
+                        let x = d.clamp(0.0, k_end as f32);
+                        let k = (x.floor() as usize).min(k_end);
+                        let f = x - k as f32;
+                        sign * (u[k] + (u[(k + 1).min(k_end)] - u[k]) * f)
+                    };
+                    let (bad, clear) =
+                        corridor.check_profile(shift, &prof, k_end as f32, half_width, want_edge);
+                    if bad != 0 {
+                        verdict = 3;
+                        counts[2] += 1;
+                        if ground_kind == 0 {
+                            ground_kind = bad;
+                        }
+                    }
+                    ce = clear;
+                }
+                // out beyond the lane: nobody may come on the lane it reaches over onto
+                if verdict == 1 && beyond {
+                    if onto_opp {
+                        if let Some((opp, os, _)) = opposite {
+                            let blocked = *onc.get_or_insert_with(|| {
+                                let v = st.speed.max(3.0);
+                                let from = os - st.front - span;
+                                let to = os + st.rear + 4.0;
+                                self.oncoming_block(i, opp, from, to, span / v + 1.5, true, by_lane)
+                            });
+                            if let Some((who, t)) = blocked {
+                                verdict = 4;
+                                counts[3] += 1;
+                                let w = format!("car #{who} oncoming in {t:.1} s");
+                                if !notes.contains(&w) {
+                                    notes.push(w);
+                                }
+                            }
+                        }
+                    }
+                    if let (true, Some(nb)) = (verdict == 1, next) {
+                        if let Some((snb, _)) = self.net.lanes[nb].nearest_point(here) {
+                            if !self.lane_clear(i, nb, snb, st.rear + 8.0, span + 10.0, by_lane) {
+                                verdict = 4;
+                                counts[3] += 1;
+                                let w = "a car in the next lane".to_string();
+                                if !notes.contains(&w) {
+                                    notes.push(w);
+                                }
+                            }
+                        }
+                    }
+                }
+                let pts: Vec<DVec3> = (0..=k_end)
+                    .step_by(3)
+                    .map(|k| {
+                        let (c, r) = row_at(k as f32);
+                        c + r.extend(0.0) * (sign * u[k]) as f64
+                    })
+                    .collect();
+                if verdict == 1 {
+                    counts[0] += 1;
+                    let onc_cost = if onto_opp { w_onc } else { 0.0 };
+                    let cost = peak + w_safe * ((want_bus - cb) + (want_edge - ce)) + onc_cost;
+                    if best.as_ref().map(|b| cost < b.0 - 1e-4).unwrap_or(true) {
+                        best = Some((cost, sign, peak, u[..=k_end].to_vec(), k_end, cands.len()));
+                    }
+                }
+                cands.push((verdict, pts));
+            }
+        }
+        // what was looked at, for the debug view
+        let mut marks: Vec<(DVec3, u8)> = Vec::new();
+        for k in 0..corridor.n {
+            let (q, r, road) = corridor.pts[k];
+            if road.is_nan() || k as f32 * Corridor::DS < shift - 1.0 {
+                continue;
+            }
+            for j in 0..corridor.cols() {
+                let code = corridor.at(k, j);
+                if code != 0 || (k % 2 == 0 && j % 2 == 0) {
+                    let o = (j - corridor.half) as f64 * corridor.step as f64;
+                    let w = q + r * o;
+                    marks.push((DVec3::new(w.x, w.y, road + 0.1), code));
+                }
+            }
+        }
+        let odo = st.odometer;
+        let id = car.id;
+        let debug = omsi_cfg::env::var_os("OMSI_DEBUG_TRAFFIC").is_some();
+        let kind = ["", "kerb or wall", "drop", "no asphalt"][ground_kind as usize];
+        let summary = format!(
+            "{} bends up to {max_dev:.1} m: possible {}, too far {}, ground {}{}, traffic {}, no room {}, over the limit {}, lane blocked (overtake) {}{}",
+            counts[7],
+            counts[0],
+            counts[1],
+            counts[2],
+            if kind.is_empty() { String::new() } else { format!(" ({kind})") },
+            counts[3],
+            counts[4],
+            counts[5],
+            counts[6],
+            if notes.is_empty() { String::new() } else { format!(" [{}]", notes.join("; ")) }
+        );
+        let time = self.time;
+        let chosen = best;
+        let mut cands = cands;
+        if let Some(b) = chosen.as_ref() {
+            cands[b.5].0 = 0;
+        }
+        let fresh = fresh;
+        let car = &mut self.cars[i];
+        car.squeeze_t = time + retry;
+        if fresh.is_some() {
+            car.avoid.corridor = fresh;
+        }
+        car.avoid.frac = share;
+        car.avoid.cands = cands;
+        car.avoid.marks = marks;
+        car.avoid.squeeze.clear();
+        match chosen {
+            Some((cost, sign, peak, u, k_end, _)) => {
+                // the bent way, laid out for the car point by point; the S-curve takes it on
+                // from the last point (to the middle of the lane, if it is not there yet)
+                let curve: Vec<(f32, f32)> = u
+                    .iter()
+                    .enumerate()
+                    .map(|(k, v)| (odo + k as f32, sign * v))
+                    .collect();
+                let end_o = sign * u[k_end];
+                car.state.lateral_curve = curve;
+                car.state.lateral_target = 0.0;
+                car.state.lateral_ramp = (
+                    end_o,
+                    0.0,
+                    odo + k_end as f32,
+                    (end_o.abs() * 6.0).clamp(2.0, 16.0),
+                );
+                car.squeeze_p = Some((sign * peak, odo + k_end as f32));
+                let text = format!("BENT WAY {:+.2} m at most, over {k_end} m (vehicle in the lane {:.0} %, cost {cost:.2}); {summary}", sign * peak, share * 100.0);
+                car.avoid.squeeze.push_str(&text);
+                if debug {
+                    log::info!("t={:.1}: car {id} bends its way {:+.2} m aside to go by the player's vehicle {gap:.1} m ahead (over {k_end} m): {summary}", time, sign * peak);
+                }
+                Some(sign * peak)
+            }
+            None => {
+                let text = format!(
+                    "no bend fits (vehicle in the lane {:.0} %): {summary}",
+                    share * 100.0
+                );
+                car.avoid.squeeze.push_str(&text);
+                if debug {
+                    log::info!("t={:.1}: car {id} finds no way round the player's vehicle {gap:.1} m ahead: {summary}", time);
+                }
+                None
+            }
+        }
+    }
+
+    /// [ROLLBACK corridor-104] The road in front of car `i` (see `Corridor`): its way as the
+    /// lane lays it out (no sideways offset), `reach` m of it, and the ground along it, `half`
+    /// cells of `step` m to each side. A car that has no ground to ask gets the way only.
+    fn build_corridor(&self, i: usize, reach: f32, step: f32, half: i32) -> Corridor {
+        let car = &self.cars[i];
+        let mut base = car.state.clone();
+        base.lateral = 0.0;
+        base.lateral_target = 0.0;
+        base.lateral_ramp = (0.0, 0.0, base.odometer, 1.0);
+        base.lateral_curve.clear();
+        let mut c = Corridor {
+            odo: car.state.odometer,
+            time: self.time,
+            reach,
+            step,
+            half,
+            ..Default::default()
+        };
+        let mut d = 0.0f32;
+        while d <= reach {
+            let b = base.way_point(&self.net, d);
+            let n = base.way_point(&self.net, d + 0.5);
+            let dir = (n - b).truncate().normalize_or_zero();
+            let right = if dir == DVec2::ZERO {
+                DVec2::X
+            } else {
+                DVec2::new(dir.y, -dir.x)
+            };
+            c.rows.push((b, right));
+            d += 1.0;
+        }
+        let Some(ground) = car.vehicle.contact.as_ref() else {
+            return c;
+        };
+        let probe = ground.session();
+        let tile = omsi_map::tile_size();
+        let surfaces = self.surfaces.as_ref().map(|s| s.read());
+        let surf = surfaces.as_deref();
+        let cols = (2 * half + 1) as usize;
+        // [ROLLBACK object-106] a road laid out as objects (no road spline under it) has no
+        // asphalt in the tile's road surface: there the centre line itself is "no asphalt".
+        // The ground then goes by kerbs and drops only, and by how far the lanes reach (the
+        // lane and its neighbour on the kerb side, the oncoming side as far as the other
+        // carriageway's lane): beyond that is no road.
+        let lane_idx = car.state.lane;
+        let lane = &self.net.lanes[lane_idx];
+        let lane_half = if lane.width > 1.0 { lane.width } else { 3.0 } * 0.5;
+        let out = self.net.oncoming_sign();
+        let neighbour_w = |right: bool| {
+            let n = if right { lane.right } else { lane.left };
+            n.map(|n| self.net.lanes[n].width.max(2.5)).unwrap_or(0.0)
+        };
+        let ext_kerb = lane_half + 0.4 + neighbour_w(out < 0.0);
+        let ext_onc = match self.net.opposite(lane_idx, car.state.s) {
+            Some((_, _, side)) => side + 1.4,
+            None => lane_half + 0.4 + neighbour_w(out > 0.0),
+        };
+        for k in 0..c.rows.len().div_ceil(2) {
+            let (b, right) = c.rows[2 * k];
+            match probe(b.x, b.y, b.z + 0.3).below {
+                Some(road) => {
+                    c.pts.push((b.truncate(), right, road));
+                    // [ROLLBACK object-107] the asphalt of the tile is trusted only where it
+                    // reaches past the lane itself (a spline road): an object road has none
+                    // beside its path, and a test on it made the cars see road only straight
+                    // ahead. Then kerbs and drops, and the reach of the lanes, say what is road.
+                    let offs: Vec<f64> = (0..cols)
+                        .map(|j| (j as i32 - half) as f64 * step as f64)
+                        .collect();
+                    let strict: Vec<u8> = offs
+                        .iter()
+                        .map(|&off| {
+                            ground_code(&*probe, surf, tile, b.truncate() + right * off, road, true)
+                        })
+                        .collect();
+                    let wide = offs.iter().zip(&strict).any(|(&off, &code)| {
+                        code == 0
+                            && off.abs() > lane_half as f64 + 0.3
+                            && off.abs() <= ext_onc.max(ext_kerb) as f64
+                    });
+                    // [ROLLBACK lanes-107] other lanes running alongside (an object road
+                    // does not link them to this one): where one lies it is road
+                    let bands = if wide {
+                        Vec::new()
+                    } else {
+                        let f = DVec2::new(-right.y, right.x);
+                        self.net
+                            .lanes_beside(b, f, ext_kerb.max(ext_onc) as f64 + 3.5)
+                    };
+                    let (mut span_lo, mut span_hi) = (-(lane_half as f64), lane_half as f64);
+                    for &(lat, hw) in &bands {
+                        span_lo = span_lo.min((lat - hw) as f64);
+                        span_hi = span_hi.max((lat + hw) as f64);
+                    }
+                    for j in 0..cols {
+                        let off = offs[j];
+                        let mut code = if wide {
+                            strict[j]
+                        } else {
+                            ground_code(
+                                &*probe,
+                                surf,
+                                tile,
+                                b.truncate() + right * off,
+                                road,
+                                false,
+                            )
+                        };
+                        if code == 0 && !wide {
+                            let reach = if off * out as f64 > 0.0 {
+                                ext_onc
+                            } else {
+                                ext_kerb
+                            };
+                            // (and what lies between them, on the same level: the strip
+                            // between two lanes of one road has no lane of its own)
+                            let on_lane = off >= span_lo - 0.3 && off <= span_hi + 0.3;
+                            if off.abs() > reach as f64 && !on_lane {
+                                code = 3;
+                            }
+                        }
+                        c.codes.push(code);
+                    }
+                }
+                None => {
+                    c.pts.push((b.truncate(), right, f64::NAN));
+                    c.codes.extend(std::iter::repeat(0u8).take(cols));
+                }
+            }
+            c.n += 1;
+        }
+        c
+    }
+
     /// On a road with one lane each way: pull out onto the other half round something
     /// standing in the lane, when the oncoming traffic leaves time enough and the car's own
     /// steering gets its front corner past the obstacle's (`AiBody::sweep_clearance`).
@@ -3487,6 +4386,30 @@ impl Traffic {
         parked_box: Option<Obb>,
         feet: &[Footprint],
     ) {
+        // [ROLLBACK avoiddbg-102] (why the pass did or did not start goes to the debug view)
+        let mut why = String::new();
+        #[rustfmt::skip]
+        self.plan_pass_run(i, lead, obstacle_len, standing, parked, way, by_lane, player, parked_box, feet, &mut why);
+        let a = &mut self.cars[i].avoid.pass;
+        a.clear();
+        a.push_str(&why);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_pass_run(
+        &mut self,
+        i: usize,
+        lead: Option<(Lead, Option<usize>)>,
+        obstacle_len: f32,
+        standing: bool,
+        parked: bool,
+        way: &[(usize, f32)],
+        by_lane: &HashMap<usize, Vec<(usize, f32, f32, bool)>>,
+        player: Option<PlayerBox>,
+        parked_box: Option<Obb>,
+        feet: &[Footprint],
+        why: &mut String,
+    ) {
         let car = &self.cars[i];
         // Rail vehicles must never use the road-vehicle passing manoeuvre.
         if car.is_rail() {
@@ -3496,33 +4419,73 @@ impl Traffic {
         // a parked car is known from afar: the driver pulls out while still rolling up to
         // it; anything else is waited behind for a moment first
         let rolling = parked && st.speed > 0.5;
-        if car.passing.is_some()
-            || st.change.is_some()
-            || (car.stopped < 3.0 && !rolling)
-            || !standing
-            || car.yielding
-            || car.at_stop()
-            || self.time < car.pass_retry
-        {
+        let early = if car.passing.is_some() {
+            "OVERTAKING (already out on the oncoming lane)"
+        } else if st.change.is_some() {
+            "changing lane"
+        } else if car.stopped < 3.0 && !rolling {
+            "has not waited 3 s yet"
+        } else if !standing {
+            "the thing ahead is not standing"
+        } else if car.yielding {
+            "giving way"
+        } else if car.at_stop() {
+            "at a stop"
+        } else if self.time < car.pass_retry {
+            "tried a moment ago"
+        } else {
+            ""
+        };
+        if !early.is_empty() {
+            why.push_str(early);
             return;
         }
-        let Some((lead, who)) = lead else { return };
+        let Some((lead, who)) = lead else {
+            why.push_str("nothing ahead");
+            return;
+        };
         let gap = lead.gap;
         // (`OMSI_DEBUG_PASS`: why a car standing behind something does not go round it,
         // twice a second)
         let debug_pass = omsi_cfg::env::var_os("OMSI_DEBUG_PASS").is_some()
             && (self.time * 2.0).floor() != ((self.time - self.last_dt) * 2.0).floor();
         let (id_dbg, t_dbg) = (car.id, self.time);
-        let skip = |why: String| {
+        let mut skip = |reason: String| {
             if debug_pass {
-                log::info!("t={t_dbg:.1}: car {id_dbg} does not pass: {why}");
+                log::info!("t={t_dbg:.1}: car {id_dbg} does not pass: {reason}");
             }
+            why.clear();
+            why.push_str(&reason);
         };
+        // [ROLLBACK deform-105] round the player's vehicle the way is bent within the lane
+        // first (`player_squeeze`); the oncoming lane only when the vehicle stands on the
+        // lane (from `sq_lane_frac` of its width), and never at a junction or light
+        if who == Some(usize::MAX) {
+            if car.squeeze_p.is_some() {
+                skip("going round within its lane (a bent way)".into());
+                return;
+            }
+            if let Some(pb) = player {
+                if let Some(reason) = self.passing_zone(i, gap, &pb) {
+                    skip(reason);
+                    return;
+                }
+                let share = self.bus_lane_share(i, &pb, gap);
+                if share < tune(T_LANE_FRAC) {
+                    skip(format!(
+                        "the vehicle stands on {:.0} % of the lane only: a bent way, no overtaking",
+                        share * 100.0
+                    ));
+                    return;
+                }
+            }
+        }
         // a timetable bus does not pass what stands at its own next stop: it queues for it
         if let Some((ri, ss)) = car.next_stop() {
             if ri >= st.route_index
                 && st.route_distance(&self.net, ri, ss) < gap + obstacle_len + st.front + 15.0
             {
+                skip("a timetable bus queues for its own stop".into());
                 return;
             }
         }
@@ -3550,14 +4513,34 @@ impl Traffic {
         }
         let lane = &self.net.lanes[st.lane];
         if lane.left.is_some() || lane.right.is_some() {
-            return; // a road with lanes to change to: `plan_bypass`
+            // a road with lanes to change to: `plan_bypass`
+            skip("a road with several lanes: it changes lane instead".into());
+            return;
         }
         // the manoeuvre happens before the next junction, or reaches only its mouth
         let pass_len = real + obstacle_len + st.front + st.rear + 6.0;
         // and something that stands just before a light or a junction is waiting there
+        // [ROLLBACK passplayer-96] the player's vehicle is not driven round on the oncoming side
+        // like a breakdown: not before a light or a junction within 60 m (it waits for the
+        // lights, and the kerb behind the oncoming lane is never looked at), and only after
+        // half a minute of standing
+        let player_reach = if who == Some(usize::MAX) { 60.0 } else { 25.0 };
+        // (a bus whose indicator is out towards the traffic is pulling out: waited for)
+        let out_side = if self.net.left_hand { 2 } else { 1 };
+        let pulling_out = match who {
+            Some(usize::MAX) => self.player_signal_age < 1.0,
+            Some(j) if j < self.cars.len() => {
+                self.cars[j].is_bus() && self.cars[j].state.blinker == out_side
+            }
+            _ => false,
+        };
+        if pulling_out {
+            skip("the bus is about to pull out".into());
+            return;
+        }
         let waits_there = way.iter().skip(1).any(|w| {
             (self.net.lanes[w.0].traffic_light.is_some() || !self.net.crossings[w.0].is_empty())
-                && w.1 < real + st.front + obstacle_len + 25.0
+                && w.1 < real + st.front + obstacle_len + player_reach
         });
         if waits_there && !parked {
             skip("it waits before a light or a junction".into());
@@ -3658,6 +4641,7 @@ impl Traffic {
             aborted: false,
             hold: 0.0,
             creep: !rolling,
+            by_player: who == Some(usize::MAX),
         };
         let clear_d = probe.clear_at(car.half_width);
         // Time out there: until the car is back far enough to be out of the oncoming
@@ -3766,6 +4750,7 @@ impl Traffic {
             }
         }
         let Some(ramp) = chosen else {
+            skip(format!("no S-curve clears the obstacle (best clearance {best_seen:.2} m, needs {need:.2} m)"));
             if debug {
                 // where the obstacle's box is from the car (right, ahead, turned by)
                 let rel = obstacles.first().map(|o| {
@@ -3792,12 +4777,14 @@ impl Traffic {
             aborted: false,
             hold: 0.0,
             creep: !rolling,
+            by_player: who == Some(usize::MAX),
         });
         car.state.lateral_target = side * out;
         // pull out over what room there is (from a standstill a car turns out steeply)
         let lat0 = car.state.lateral;
         car.state.lateral_ramp = (lat0, side * out, odo, ramp);
         car.stopped = 0.0;
+        why.push_str("OVERTAKE started on the oncoming lane");
         if self.first_passer.is_none() {
             self.first_passer = Some((id, self.time));
         }
@@ -3993,10 +4980,13 @@ impl Traffic {
         let t_me = pass_time(r, creep, st, v_cap);
         let from = os - st.front - r - 1.0;
         let to = os + st.rear;
-        let Some((who, t)) = self.oncoming_block(i, opp, from, to, t_me + 0.5, false, by_lane)
-        else {
+        // [ROLLBACK buspass-101] (or the bus it is going round has put its indicator out)
+        let leaving = p.by_player && self.player_signal_age < 1.0;
+        let blocked = self.oncoming_block(i, opp, from, to, t_me + 0.5, false, by_lane);
+        if blocked.is_none() && !leaving {
             return;
-        };
+        }
+        let (who, t) = blocked.unwrap_or((0, 0.0));
         // still in its lane far enough for the oncoming car to get by, and able to stop
         // before the obstacle (a car of two and a half metres needs that much of its lane)
         let v = st.speed;
@@ -5036,11 +6026,16 @@ impl Traffic {
         (l.gap > 0.5 && l.gap >= comfortable).then_some(l.gap)
     }
 
-    /// `player_in_way` for a car of half width `half_width` on the way `st` lays out (also a
-    /// way it only considers taking).
-    /// `widen`: the box grown by this much (m) towards the traffic (the left, or the right
-    /// on a left-hand-traffic map).
-    fn player_on_way(&self, st: &AiState, half_width: f32, player: &PlayerBox, widen: f64) -> Option<Lead> {
+    /// [ROLLBACK deform-105] The player's box for a car of half width `half_width` (and `side`
+    /// m of margin beside it) going the way `way_dir` points; `widen`: see `player_on_way`.
+    fn player_box(
+        &self,
+        way_dir: DVec2,
+        half_width: f32,
+        side: f32,
+        player: &PlayerBox,
+        widen: f64,
+    ) -> BoxTest {
         let (centre, heading, half_len, half_w, speed) = *player;
         let h = heading.to_radians();
         let fwd = DVec2::new(h.sin(), h.cos());
@@ -5049,21 +6044,39 @@ impl Traffic {
         let centre = centre + (right * (out * widen * 0.5)).extend(0.0);
         let half_w = half_w + (widen * 0.5) as f32;
         let horizon = if self.player_priority { 5.0 } else { 1.5 };
-        let way_dir = (st.way_point(&self.net, 3.0) - st.way_point(&self.net, 0.0)).truncate();
         let ahead = player_reach_ahead(half_len, speed, horizon, fwd, way_dir);
         let behind = half_len as f64 + ((-speed).max(0.0) * horizon) as f64;
-        let wide = (half_w + half_width + 0.35) as f64;
+        let wide = (half_w + half_width + side) as f64;
         let margin = PLAYER_BOX_MARGIN as f64;
-        let kappa = self.player_kappa as f64;
-        let inside = |p: DVec3| {
-            if kappa.abs() < PLAYER_CURVE_MIN {
-                return in_player_box(p, centre, fwd, right, wide, ahead + margin, behind + margin);
-            }
-            // on a bend: the bus's own length as it is, and the stretch ahead of its nose
-            // along the circle it is driving
-            in_player_box(p, centre, fwd, right, wide, half_len as f64 + margin, behind + margin)
-                || in_player_arc(p, centre, fwd, right, wide, half_len as f64, (ahead - half_len as f64).max(0.0) + margin, kappa)
+        // [ROLLBACK curve-101] on a bend: the bus's own box as it stands, nothing guessed
+        // ahead of it (the stretch along the circle it was driving held up cars that the
+        // bus never came near)
+        let ahead = if (self.player_kappa as f64).abs() < PLAYER_CURVE_MIN {
+            ahead + margin
+        } else {
+            half_len as f64 + margin
         };
+        BoxTest {
+            centre,
+            fwd,
+            right,
+            wide,
+            ahead,
+            behind: behind + margin,
+        }
+    }
+
+    /// `player_in_way` for a car of half width `half_width` on the way `st` lays out (also a
+    /// way it only considers taking).
+    /// `widen`: the box grown by this much (m) towards the traffic (the left, or the right
+    /// on a left-hand-traffic map).
+    fn player_on_way(&self, st: &AiState, half_width: f32, player: &PlayerBox, widen: f64) -> Option<Lead> {
+        let (_, heading, _, _, speed) = *player;
+        let h = heading.to_radians();
+        let fwd = DVec2::new(h.sin(), h.cos());
+        let way_dir = (st.way_point(&self.net, 3.0) - st.way_point(&self.net, 0.0)).truncate();
+        let bx = self.player_box(way_dir, half_width, tune(T_SIDE), player, widen);
+        let inside = |p: DVec3| bx.contains(p);
         let look = (st.speed * st.speed / (2.0 * st.decel) + st.speed * 2.0 + 15.0)
             .clamp(15.0, look_ahead(st.speed));
         let mut d = 0.0f32;
@@ -5501,6 +6514,11 @@ impl Traffic {
             let mut parked_box: Option<Obb> = None;
             let kerb_swerve: Option<f32>;
             let mut squeeze: Option<u64> = None;
+            // [ROLLBACK squeeze-101] the standing player's vehicle (seen early) is gone by within the lane
+            let _player_swerve = match player {
+                Some(pb) => self.player_squeeze(i, &pb, player_standing, &by_lane),
+                None => None,
+            };
             {
                 let car = &self.cars[i];
                 let st = &car.state;
@@ -5637,7 +6655,7 @@ impl Traffic {
             let (obstacle_len, at_stop) = match lead.and_then(|l| l.1) {
                 Some(usize::MAX) => (
                     player.map(|p| p.2 * 2.0).unwrap_or(12.0),
-                    player_standing > 10.0,
+                    player_standing > 4.0,
                 ),
                 Some(j) if j < self.cars.len() => self.standing_queue(j),
                 _ => (4.8, false),
@@ -5686,8 +6704,18 @@ impl Traffic {
                                     < real + obstacle_len + st.front + 15.0
                         })
                         .unwrap_or(false);
+                    // ([ROLLBACK bus-106] a bus queueing for the stop of another bus ahead of it
+                    // comes up close behind it: half a metre over its minimum gap)
+                    // ([ROLLBACK bus-107] also the player's vehicle, and closer still: 0.3 m)
+                    let behind_bus = car.is_bus()
+                        && matches!(who, Some(j) if j == usize::MAX || (j < self.cars.len() && self.cars[j].is_bus()));
                     let want = if queues {
-                        st.min_gap + 2.0
+                        if behind_bus {
+                            // ([ROLLBACK bus-108] still closer: about half the minimum gap)
+                            (st.min_gap * 0.5).max(0.8)
+                        } else {
+                            st.min_gap + 2.0
+                        }
                     } else {
                         car.pass_room.max(st.min_gap)
                     };
@@ -5896,6 +6924,43 @@ impl Traffic {
             self.cars[i].held = stop_at.is_some() || lead.map(|l| l.0.gap < 12.0).unwrap_or(false);
             // a timetable bus: its stops (see `bus_service`); any other car keeps to the middle
             // of its lane, or swerves round a car parked at the kerb
+            // [ROLLBACK bus-106] close behind another bus standing at the same stop (one bay)
+            let lead_close = {
+                let me = &self.cars[i];
+                let my_stop = me.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id);
+                // [ROLLBACK bus-107] the player's vehicle standing close ahead counts too
+                let player_lead = lead.is_some_and(|(l, who)| {
+                    who == Some(usize::MAX)
+                        && l.gap < 9.0
+                        && player.is_some_and(|p| p.4.abs() < 0.3)
+                });
+                match (me.lead_info, my_stop) {
+                    _ if player_lead && my_stop.is_some() => true,
+                    (Some((id, gap)), Some(sid)) => {
+                        gap < 9.0
+                            && self.cars.iter().any(|o| {
+                                o.id == id
+                                    && o.state.speed.abs() < 0.3
+                                    && o.at_stop()
+                                    && o.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id)
+                                        == Some(sid)
+                            })
+                    }
+                    _ => false,
+                }
+            };
+            // [ROLLBACK bus-108] another bus following this one, for the same stop
+            let follower_close = {
+                let me = &self.cars[i];
+                let my_stop = me.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id);
+                my_stop.is_some()
+                    && self.cars.iter().any(|o| {
+                        o.id != me.id
+                            && o.lead_info
+                                .is_some_and(|(id, gap)| id == me.id && gap < 40.0)
+                            && o.bus.as_ref().and_then(|b| b.stops.front()).map(|s| s.id) == my_stop
+                    })
+            };
             {
                 let car = &mut self.cars[i];
                 if let Some(service) = car.bus.as_mut() {
@@ -5912,6 +6977,8 @@ impl Traffic {
                         stopped: car.stopped,
                         passing: car.passing.is_some(),
                         kerb_swerve,
+                        lead_close,
+                        follower_close,
                         debug: debug || omsi_cfg::env::var_os("OMSI_DEBUG_PAX").is_some(),
                     };
                     if let Some(at) = service.step(&mut car.state, &mut car.vehicle, &ctx) {
@@ -5920,8 +6987,9 @@ impl Traffic {
                             why = ("service", at);
                         }
                     }
-                } else if car.passing.is_none() && car.park.is_none() {
-                    // round a car parked at the kerb, else in the middle of the lane
+                } else if car.passing.is_none() && car.park.is_none() && car.state.lateral_curve.is_empty() {
+                    // round a car parked at the kerb, else in the middle of the lane (a way bent
+                    // round the player's vehicle keeps its own offset)
                     let target = kerb_swerve.unwrap_or(0.0);
                     if debug && (target - car.state.lateral_target).abs() > 0.3 {
                         log::info!(
@@ -6605,7 +7673,11 @@ impl Traffic {
                 std::mem::take(&mut c.vehicle.host.fired_file_triggers);
             c.vehicle.host.street_cond = street_cond;
             c.vehicle.set_engine_var("StreetCond", street_cond);
-            if let Some(ss) = c.sounds.as_mut() {
+            if let Some(ss) = c.sounds.as_mut().filter(|_| c.vehicle.ai_parked) {
+                // [ROLLBACK aiparked-93] standing out a long layover the engine is off for the
+                // ear too: its loops stop (the script's own variables did not always stop them)
+                ss.stop_all(audio);
+            } else if let Some(ss) = c.sounds.as_mut() {
                 ss.set_muffled(muffled);
                 let xf = c.vehicle.world_transform();
                 let v = &c.vehicle;
@@ -7560,6 +8632,9 @@ impl Traffic {
             seed: 0,
             scheme: None,
             squeeze: None,
+            squeeze_p: None,
+            squeeze_t: 0.0,
+            avoid: AvoidDbg::default(),
             pass_room: 0.0,
             pass_retry: 0.0,
             light_at: None,
@@ -7811,6 +8886,7 @@ const PLAYER_CURVE_MIN: f64 = 0.004;
 /// Whether `p` lies within `wide` of the arc the player's nose follows - from the point
 /// `nose` ahead of its centre, for `reach` metres along a circle of curvature `kappa` (1/m,
 /// positive to the right, the side of `right`).
+#[allow(dead_code)]
 fn in_player_arc(p: DVec3, centre: DVec3, fwd: DVec2, right: DVec2, wide: f64, nose: f64, reach: f64, kappa: f64) -> bool {
     let rel = p.truncate() - centre.truncate();
     let (mut x, y) = (rel.dot(right), rel.dot(fwd) - nose);

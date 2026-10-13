@@ -244,6 +244,24 @@ every `[stamper]` of every section, and a passenger with a ticket to stamp uses 
 nearest the door they came in by. Write one `[stamper]` block per validator (path point,
 then x, y, z of the device, as usual); OMSI 2 still takes the last of them.
 
+## Articulated buses: interior sounds of each section apart
+
+In OMSI 2 the `[sound]` of a section is heard in the whole bus: standing in the rear section
+of an articulated bus you hear the interior sounds of the front one (and the other way
+round). Put `[int_sounds_separate]` (no parameters) in the `.bus` of the front section - or
+in the `.ovh` of any rear section - and the sections keep their interior sounds to themselves:
+
+* in a section, you hear that section's sounds as usual;
+* of every *other* section you hear only the entries made for the outside (`[viewpoint]` 1,
+  or none), and only as they come through the bodywork - at the volume of `Snd_OutsideVol`
+  and through the same low-pass as the traffic outside (nothing at all while the script keeps
+  `Snd_OutsideVol` at 0.01 or below). Entries that are for the interior only (`[viewpoint]` 2)
+  are silent there.
+
+Which section you are in follows the camera: the driver's view is the front section's, the
+passenger view and the walker's camera are in the section they stand in (the joint's middle
+divides them). Without the tag nothing changes, and a bus with one section is not affected.
+
 ## Scripts and plugins
 
 - Script variables and string variables have no count limit.

@@ -543,6 +543,7 @@ impl ApplicationHandler for App {
                     return;
                 }
                 let __t = Instant::now();
+                crate::services::SKIP_PETROL_CHECK.store(self.settings.skip_petrol_check, std::sync::atomic::Ordering::Relaxed); // [ROLLBACK petrol-93]
                 self.drive_streaming();
                 *self.profile.entry("streaming").or_default() += __t.elapsed().as_secs_f64();
                 let __t = Instant::now();
@@ -582,6 +583,14 @@ impl ApplicationHandler for App {
                         self.player.as_ref(),
                         &r.options,
                     );
+                    // [ROLLBACK clockjump-93] a time set by hand: the timetable's buses are put out anew
+                    if let Some(s) = self.schedule.as_mut().filter(|_| self.args.schedule) {
+                        if s.note_clock(t.day_time, dt as f64, self.settings.time_speed) {
+                            s.time_jumped(w, t, r, scene, &self.clock);
+                            self.first_populate = true;
+                            self.populate_t = 0.0;
+                        }
+                    }
                     self.populate_t -= dt;
                     if self.populate_t <= 0.0 && !self.paused {
                         // come back quickly while there is a backlog of departures to put out
@@ -942,6 +951,11 @@ impl ApplicationHandler for App {
                         // (the sound crossfades between the street and the cab as the
                         // walker's camera goes in or out of the bus)
                         p.foot_mix = if self.view == "foot" { crate::on_foot::foot_cab_mix(self.camera.as_ref().map(|c| c.position), p, own_bus_inside) } else { None };
+                        // [ROLLBACK intsep-122] which section of the bus the camera is in
+                        p.listener_section = match (self.humans.as_ref(), self.camera.as_ref()) {
+                            (Some(h), Some(c)) => h.section_at(crate::humans::BusId::Player, c.position),
+                            _ => None,
+                        };
                         p.tick(
                             dt,
                             self.audio.as_ref(),
@@ -1306,6 +1320,7 @@ impl ApplicationHandler for App {
                         q.sync_transforms(r, scene, false);
                     }
                 }
+                self.keep_placed_places_clear(dt);
                 if let Some(a) = self.audio.as_ref() {
                     match self.player.as_mut() {
                         Some(p) => {
@@ -1354,6 +1369,22 @@ impl ApplicationHandler for App {
                             log::info!("people: {} bus stops with timetable targets", t.len());
                         }
                     }
+                    // [ROLLBACK soon-90] where buses leave for in the next 20 minutes: whom the people
+                    // appearing at the stops wait for (renewed every 15 s of the clock)
+                    if let Some(s) = self.schedule.as_ref() {
+                        // [ROLLBACK reshuffle-91] a new time set (the clock jumped): the people
+                        // who wait for buses that do not leave then go, new ones come
+                        let step = (self.clock.time - h.clock_seen + 43_200.0).rem_euclid(86_400.0) - 43_200.0;
+                        let jumped = h.clock_seen.is_finite() && step.abs() > 90.0 + dt as f64 * self.settings.time_speed as f64 * 5.0;
+                        h.clock_seen = self.clock.time;
+                        if jumped || (self.clock.time - h.soon_clock).abs() > 15.0 {
+                            h.soon_clock = self.clock.time;
+                            h.soon = Some(s.soon_targets(self.clock.time, self.duty.as_ref(), 20.0 * 60.0));
+                        }
+                        if jumped {
+                            h.reshuffle_waiting();
+                        }
+                    }
                     // (whom the player's bus takes on: nobody waiting in free drive)
                     h.set_duty(self.duty.as_ref());
                     // (the riders leave a bus the driver has walked away from)
@@ -1396,6 +1427,11 @@ impl ApplicationHandler for App {
                         r,
                         scene,
                     );
+                    // [ROLLBACK payload-121] the passengers weigh on the player's bus, section by section
+                    if let Some(p) = self.player.as_mut() {
+                        p.vehicle
+                            .set_payload(h.payload_of(crate::humans::BusId::Player));
+                    }
                     // validators used: the bus's `ev_Stamper` sound
                     for bus in h.take_stamped() {
                         match bus {
@@ -1811,10 +1847,16 @@ impl ApplicationHandler for App {
                             self.clock_hold = 0.0;
                         }
                     }
-                    // = and - zoom inside the bus (the numpad's are door keys there), unless
-                    // the player bound them to something of their own (#701)
-                    let zoom_in = self.keys.contains(&KeyCode::Equal) && !self.own_keys.contains(&13);
-                    let zoom_out = self.keys.contains(&KeyCode::Minus) && !self.own_keys.contains(&12);
+                    // [ROLLBACK zoomkeys-122] was: = and - (and the numpad's + and -) zoomed. Now
+                    // only the keys the player gave `view_zoom_in` / `view_zoom_out` (none by default)
+                    let action_held = |name: &str| {
+                        self.game_keys
+                            .iter()
+                            .filter(|b| b.scan_code != 0 && b.action.eq_ignore_ascii_case(name))
+                            .any(|b| self.keys.iter().any(|k| crate::keys::dik_code(*k) == Some(b.scan_code)))
+                    };
+                    let zoom_in = action_held("view_zoom_in");
+                    let zoom_out = action_held("view_zoom_out");
                     if matches!(self.view.as_str(), "driver" | "pax") {
                         if zoom_in {
                             self.zoom_by(3.0 * dt);
@@ -1823,14 +1865,12 @@ impl ApplicationHandler for App {
                             self.zoom_by(-3.0 * dt);
                         }
                     }
-                    // W/S and the wheel pull the outside camera in and out
+                    // the outside camera: its distance
                     if self.view == "outside" {
-                        if zoom_in || self.keys.contains(&KeyCode::NumpadAdd)
-                        {
+                        if zoom_in {
                             self.orbit = (self.orbit - 12.0 * dt).max(ORBIT_MIN);
                         }
-                        if zoom_out || self.keys.contains(&KeyCode::NumpadSubtract)
-                        {
+                        if zoom_out {
                             self.orbit = (self.orbit + 12.0 * dt).min(ORBIT_MAX);
                         }
                     }
@@ -2185,18 +2225,7 @@ impl ApplicationHandler for App {
                     if self.editor.is_some() {
                         lines.push("Object editor: click picks · drag moves · wheel turns (Shift lifts) · Del · C copy · V variant · Backspace undo · Ctrl+S save · Esc".into());
                     }
-                    if let Some(d) = self.duty.as_ref().filter(|d| d.trip_done()) {
-                        lines.push(match d.trips.get(d.trip_index + 1) {
-                            Some(next) => format!(
-                                "End of the trip. Next: {} to {}, from {} at {} (it starts by itself a minute before)",
-                                if next.line.trim().is_empty() { "service trip".to_string() } else { format!("line {}", next.line) },
-                                next.terminus.strip_prefix(&format!("{} ", next.line)).unwrap_or(&next.terminus),
-                                next.stops.first().map(|s| s.name.trim()).unwrap_or("?"),
-                                crate::schedule::hhmm(next.departure)
-                            ),
-                            None => "End of the duty: the tour's last trip is done".into(),
-                        });
-                    }
+                    // [ROLLBACK tip-122] the "End of the trip. Next: ..." line used to be here
                     if let Some((msg, left)) = self.service_msg.as_mut() {
                         *left -= dt;
                         if *left > 0.0 {
@@ -2346,6 +2375,12 @@ impl ApplicationHandler for App {
                     }
                     // the developer tools window: what it said, and the dots and lines it asked for
                     crate::devtools_proc::tick(&mut self.devtools, self.player.as_mut(), dt);
+                    // [ROLLBACK aidebug-89] the AI debug page: what the player's bus shows
+                    if let (Some(h), Some(p)) = (self.humans.as_ref(), self.player.as_ref()) {
+                        self.devtools.send_sign(dt, || h.debug_sign(&p.vehicle));
+                    }
+                    self.devtools
+                        .send_weights(dt, self.player.as_ref().map(|p| p.vehicle.weights_kg()));
                     for what in self.devtools.take_reloads() {
                         let text = match (self.humans.as_mut(), self.player.as_mut()) {
                             (Some(h), Some(p)) => h.reload_cabin(what, &mut p.vehicle),
@@ -2353,6 +2388,36 @@ impl ApplicationHandler for App {
                         };
                         self.devtools.note(&text);
                         self.service_msg = Some((text, 4.0));
+                    }
+                    // [ROLLBACK payload-121] the Actions page: people on every standing place or seat, or none
+                    for act in self.devtools.take_pax_actions() {
+                        let text = match (
+                            act.as_str(),
+                            self.humans.as_mut(),
+                            self.player.as_ref(),
+                            self.world.as_ref(),
+                            self.renderer.as_ref(),
+                            Some(&mut *scene),
+                        ) {
+                            ("clear", Some(h), _, _, _, _) => {
+                                format!("{} fake passengers removed", h.clear_fake())
+                            }
+                            (
+                                "fill_standing" | "fill_seats",
+                                Some(h),
+                                Some(p),
+                                Some(w),
+                                Some(r),
+                                Some(scene),
+                            ) => {
+                                let n =
+                                    h.fill_places(act == "fill_standing", &p.vehicle, w, r, scene);
+                                format!("{n} passengers put in")
+                            }
+                            _ => "No vehicle with passengers yet".to_string(),
+                        };
+                        self.devtools.note(&text);
+                        self.service_msg = Some((text, 3.0));
                     }
                     for kind in self.devtools.take_file_reloads() {
                         use crate::devtools_proc::FileKind;
@@ -2383,7 +2448,7 @@ impl ApplicationHandler for App {
                             let rig = (self.settings.triple.enabled && !self.settings.vr_requested()).then(|| {
                                 self.settings.triple.zoomed(s.config.width, s.config.height, self.view_zoom.get(&self.view).copied().unwrap_or(1.0))
                             });
-                            crate::devtools_proc::marks(&self.devtools.view, self.humans.as_mut(), p, cam, s.config.width as f32, hud[3], rig.as_ref(), hud[0])
+                            crate::devtools_proc::marks(&self.devtools.view, self.humans.as_mut(), self.traffic.as_ref(), p, cam, s.config.width as f32, hud[3], rig.as_ref(), hud[0])
                         }
                         _ => Vec::new(),
                     };
@@ -3404,6 +3469,24 @@ impl App {
                     // (a greyed-out line cannot be clicked)
                     if self.menu_item_off(k) {
                         return;
+                    }
+
+                    // [ROLLBACK walkmenus-125] a button of a group in the row: the row's action
+                    // with the button's number
+                    let btn = self
+                        .ui
+                        .as_ref()
+                        .and_then(|u| u.menu_btns.iter().find(|b| b.0 == row))
+                        .and_then(|b| {
+                            b.1.iter()
+                                .position(|r| self.cursor.0 >= r[0] && self.cursor.0 <= r[2])
+                        });
+                    if let Some(j) = btn {
+                        if self.chooser.is_some() {
+                            self.chooser = Some(k);
+                            self.group_click(k, j);
+                            return;
+                        }
                     }
 
                     if let Some(c) = ctl {

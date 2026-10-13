@@ -287,7 +287,7 @@ fn duty_panel(l: &mut Launcher, body: Rect) {
     let lines: Vec<(String, String, usize)> = l.state.lines.iter()
         .filter(|x| x.user_allowed)
         .filter(|x| q.is_empty() || x.name.to_lowercase().contains(&q))
-        .map(|x| (x.name.clone(), x.termini.join(" · "), x.tours.len()))
+        .map(|x| (x.name.clone(), x.termini.join(" · "), x.tours.iter().filter(|t| t.runs).count())) // [ROLLBACK tours-93] only the tours of the day
         .collect();
     let chosen = l.state.choice.line.clone();
     let mut pick_line = None;
@@ -350,7 +350,8 @@ fn duty_panel(l: &mut Launcher, body: Rect) {
     let q = l.drive.tour_filter.trim().to_lowercase();
     let mut ended_count = 0;
     let mut tours: Vec<(&omsi_launcher_lib::TourInfo, bool, Option<usize>)> = Vec::new();
-    for t in &line.tours {
+    for t in line.tours.iter().filter(|t| t.runs) {
+        // [ROLLBACK tours-93] tours that do not run on the chosen day are not offered
         let (ended, trip) = tour_trip(t, now, &q);
         if trip.is_none() && !t.trips.is_empty() {
             continue;
@@ -475,18 +476,78 @@ fn tour_trip(t: &omsi_launcher_lib::TourInfo, now: f64, q: &str) -> (bool, Optio
     (ended, hit.map(|(k, _)| k))
 }
 
+/// [ROLLBACK entries-120] How an entry point is named in the lists.
+pub(super) fn entry_label(e: &omsi_launcher_lib::EntryInfo) -> String {
+    if e.name.is_empty() {
+        format!("entry {}", e.index + 1)
+    } else {
+        e.name.clone()
+    }
+}
+
+/// [ROLLBACK entries-120] The digits `it` stands at, without leading zeros.
+fn digits_of(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut n = String::new();
+    while let Some(c) = it.next_if(|c| c.is_ascii_digit()) {
+        n.push(c);
+    }
+    n.trim_start_matches('0').to_string()
+}
+
+/// [ROLLBACK entries-120] Compares two names alphabetically, without regard to case, a run of digits
+/// by its value ("Stop 2" before "Stop 10").
+pub(crate) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek().copied(), b.peek().copied()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, _) => return std::cmp::Ordering::Less,
+            (_, None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let (p, q) = (digits_of(&mut a), digits_of(&mut b));
+                let o = p.len().cmp(&q.len()).then_with(|| p.cmp(&q));
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+            }
+            (Some(x), Some(y)) => {
+                let o = x.to_lowercase().cmp(y.to_lowercase());
+                if o != std::cmp::Ordering::Equal {
+                    return o;
+                }
+                a.next();
+                b.next();
+            }
+        }
+    }
+}
+
+/// [ROLLBACK entries-120] The map's entry points as their places in `global.cfg`'s list, in
+/// alphabetical order of their names.
+pub(super) fn entry_order(m: &omsi_launcher_lib::MapInfo) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..m.entry_points.len()).collect();
+    order.sort_by(|&i, &j| {
+        let a = entry_label(&m.entry_points[i]);
+        let b = entry_label(&m.entry_points[j]);
+        natural_cmp(&a, &b).then(i.cmp(&j))
+    });
+    order
+}
+
 /// The entry point the bus starts at, at `y` in the panel; the one under the mouse on the map
 /// named above it.
 fn entry_select(l: &mut Launcher, body: Rect, y: f32, free: bool) {
     let Some(m) = l.state.map().cloned() else { return };
     let mut labels = vec![if free { "Automatic (the map's first)".to_string() } else { "Automatic (nearest to the first stop)".to_string() }];
-    labels.extend(m.entry_points.iter().map(|e| if e.name.is_empty() { format!("entry {}", e.index + 1) } else { e.name.clone() }));
-    // (the choice is the entry's place in the list; 0 = automatic here)
-    let mut es = if l.state.choice.entry < 0 { 0 } else { (l.state.choice.entry as usize + 1).min(labels.len() - 1) };
+    // [ROLLBACK entries-120] the list is alphabetical; the choice stays its place in `global.cfg`
+    let order = entry_order(&m);
+    labels.extend(order.iter().map(|&i| entry_label(&m.entry_points[i])));
+    let chosen = order.iter().position(|&i| i as i32 == l.state.choice.entry);
+    let mut es = if l.state.choice.entry < 0 { 0 } else { chosen.map_or(0, |p| p + 1) };
     l.ui.p().rect(Rect::new(body.x, y - 14.0, body.w, 1.0), EDGE);
     l.ui.label(Rect::new(body.x, y, 70.0, ROW), "Start at");
     if l.ui.select("entry", Rect::new(body.x + 70.0, y, body.w - 70.0, ROW), &mut es, &labels) {
-        l.state.choice.entry = es as i32 - 1;
+        l.state.choice.entry = if es == 0 { -1 } else { order[es - 1] as i32 };
         l.state.touched();
     }
     l.ui.tooltip(Rect::new(body.x, y, 70.0, ROW), "Where the bus is put down. The orange marks on the map are the same places: click one to take it.");
@@ -1172,19 +1233,9 @@ fn step_time(l: &mut Launcher, r: Rect) {
         l.state.touched();
     }
     y += 46.0;
-    let mut traffic = l.state.choice.traffic;
-    if l.ui.slider("traffic", Rect::new(r.x, y, r.w, 34.0), &mut traffic, 0.0, 120.0, 1.0, "Cars around", &|v| format!("{v:.0}")) {
-        l.state.choice.traffic = traffic;
-        l.state.touched();
-    }
-    y += 40.0;
-    let mut v = l.state.choice.passengers;
-    if l.ui.toggle("pax", Rect::new(r.x, y, col, 32.0), &mut v, "Passengers") {
-        l.state.choice.passengers = v;
-        l.state.touched();
-    }
+    // [ROLLBACK gameplay-99] (the cars around and the passengers are in the settings' Gameplay tab)
     let mut v = l.state.choice.schedule;
-    if l.ui.toggle("sched", Rect::new(r.x + col + 12.0, y, col, 32.0), &mut v, "Timetable buses") {
+    if l.ui.toggle("sched", Rect::new(r.x, y, r.w, 32.0), &mut v, "Timetable buses") {
         l.state.choice.schedule = v;
         l.state.touched();
     }
