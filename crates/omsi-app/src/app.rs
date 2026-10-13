@@ -167,7 +167,7 @@ pub(crate) struct App {
     /// Keys pressed (true) and let go since the Lua plugins' last frame.
     pub(crate) plugin_keys: Vec<(String, bool)>,
     /// What happened since the Lua plugins' last frame: crashes, people knocked down,
-    /// stops skipped (see `plugins::queue_event`).
+    /// stops skipped, trips ended, jolts, tickets sold (see `plugins::queue_event`).
     pub(crate) plugin_events: Vec<omsi_plugin::GameEvent>,
     /// Seconds Ctrl+Shift+Page Up/Down has been held (the clock runs faster the longer).
     pub(crate) clock_hold: f32,

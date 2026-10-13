@@ -3309,8 +3309,10 @@ fn switch_driver(app: &mut App, name: &str) {
     }
     let rel = format!("Drivers/{name}.odr");
     let mut next = crate::career::Career::load(&app.args.root, &rel);
-    // (the distance and the clock of the run go on; the counters start with the new file)
+    // (the distance and the clock of the run go on; the counters start with the new file;
+    // the bus's motion and the trip driven go on)
     next.seconds = app.career.seconds;
+    next.go_on_from(&mut app.career);
     app.career = next;
     app.args.driver = Some(rel);
     app.service_msg = Some((format!("Driver: {name}"), 3.0));
